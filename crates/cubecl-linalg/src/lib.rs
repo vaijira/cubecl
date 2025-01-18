@@ -7,5 +7,8 @@ pub mod matmul;
 /// Contains convolution using matmul components
 pub mod convolution;
 
+/// Contains QR decomposition kernels
+pub mod qr;
+
 /// Contains basic tensor helpers.
 pub mod tensor;
