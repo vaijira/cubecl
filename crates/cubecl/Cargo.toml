@@ -54,3 +54,7 @@ name = "memcpy_async"
 [[bench]]
 harness = false
 name = "unary"
+
+[[bench]]
+harness = false
+name = "qr"
