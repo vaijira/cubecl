@@ -16,7 +16,7 @@ fn identity_kernel<C: Numeric>(output: &mut Tensor<Line<C>>, gap: u32) {
         let mut offset = 0;
         while offset < output.line_size() {
             let remainder = (start_pos + offset) % gap;
-            if remainder % gap == 0 {
+            if remainder == 0 {
                 line[offset] = C::from_int(1);
                 offset += gap;
             } else {
