@@ -9,14 +9,14 @@ macro_rules! testgen_qr_mgs {
     };
     ($float:ident) => {
             use super::*;
-            use cubecl_linalg::tensor::tests;
+            use cubecl_std::tests;
             use cubecl_core::flex32;
 
             pub type FloatT = $float;
 
             #[test]
             pub fn test_tiny() {
-                cubecl_linalg::qr::tests::mgs::test_mgs::<TestRuntime, FloatT>(&Default::default(), 3);
+                cubecl_qr::tests::mgs::test_qr_mgs::<TestRuntime, FloatT>(&Default::default(), 3);
             }
 
     };

@@ -1,22 +1,29 @@
-use super::WgpuResource;
-use super::{WgpuStorage, stream::WgpuStream};
+use super::storage::{WgpuResource, WgpuStorage};
 use crate::AutoCompiler;
+use crate::schedule::{BindingsResource, ScheduleTask, ScheduledWgpuBackend};
 use alloc::sync::Arc;
+use cubecl_common::bytes::Bytes;
 use cubecl_common::profile::{ProfileDuration, TimingMethod};
-use cubecl_core::compute::{CubeTask, DebugInformation};
+use cubecl_common::stream_id::StreamId;
 use cubecl_core::future::DynFut;
-use cubecl_core::server::{ProfileError, ProfilingToken};
+use cubecl_core::server::{ProfileError, ProfilingToken, ServerCommunication};
 use cubecl_core::{
-    Feature, MemoryConfiguration, WgpuCompilationOptions,
+    MemoryConfiguration, WgpuCompilationOptions,
     prelude::*,
-    server::{Binding, BindingWithMeta, Bindings, Handle},
+    server::{Binding, Bindings, CopyDescriptor},
 };
+use cubecl_core::{
+    compute::{CubeTask, DebugInformation},
+    server::{Allocation, AllocationDescriptor, IoError},
+};
+use cubecl_runtime::config::GlobalConfig;
 use cubecl_runtime::logging::ServerLogger;
-use cubecl_runtime::memory_management::offset_handles;
+use cubecl_runtime::memory_management::{MemoryAllocationMode, offset_handles};
+use cubecl_runtime::stream::scheduler::{
+    SchedulerMultiStream, SchedulerMultiStreamOptions, SchedulerStrategy,
+};
 use cubecl_runtime::{
-    memory_management::MemoryDeviceProperties,
-    server::{self, ComputeServer},
-    storage::BindingResource,
+    memory_management::MemoryDeviceProperties, server::ComputeServer, storage::BindingResource,
 };
 use hashbrown::HashMap;
 use wgpu::ComputePipeline;
@@ -26,9 +33,13 @@ use wgpu::ComputePipeline;
 pub struct WgpuServer {
     pub(crate) device: wgpu::Device,
     pipelines: HashMap<KernelId, Arc<ComputePipeline>>,
-    stream: WgpuStream,
+    scheduler: SchedulerMultiStream<ScheduledWgpuBackend>,
     pub compilation_options: WgpuCompilationOptions,
     pub(crate) backend: wgpu::Backend,
+}
+
+impl ServerCommunication for WgpuServer {
+    const SERVER_COMM_ENABLED: bool = false;
 }
 
 impl WgpuServer {
@@ -43,22 +54,54 @@ impl WgpuServer {
         tasks_max: usize,
         backend: wgpu::Backend,
         timing_method: TimingMethod,
+        logger: Arc<ServerLogger>,
     ) -> Self {
-        let stream = WgpuStream::new(
+        let backend_scheduler = ScheduledWgpuBackend::new(
             device.clone(),
             queue.clone(),
             memory_properties,
             memory_config,
             timing_method,
             tasks_max,
+            logger.clone(),
         );
+
+        let config = GlobalConfig::get();
+        let max_streams = config.streaming.max_streams;
 
         Self {
             compilation_options,
             device,
             pipelines: HashMap::new(),
-            stream,
+            scheduler: SchedulerMultiStream::new(
+                logger,
+                backend_scheduler,
+                SchedulerMultiStreamOptions {
+                    max_streams,
+                    max_tasks: tasks_max,
+                    strategy: SchedulerStrategy::Interleave,
+                },
+            ),
             backend,
+        }
+    }
+
+    fn prepare_bindings(&mut self, bindings: Bindings) -> BindingsResource {
+        // Store all the resources we'll be using. This could be eliminated if
+        // there was a way to tie the lifetime of the resource to the memory handle.
+        let resources = bindings
+            .buffers
+            .iter()
+            .map(|b| {
+                let stream = self.scheduler.stream(&b.stream);
+                stream.mem_manage.get_resource(b.clone())
+            })
+            .collect::<Vec<_>>();
+
+        BindingsResource {
+            resources,
+            metadata: bindings.metadata,
+            scalars: bindings.scalars,
         }
     }
 
@@ -66,7 +109,6 @@ impl WgpuServer {
         &mut self,
         kernel: <Self as ComputeServer>::Kernel,
         mode: ExecutionMode,
-        logger: Arc<ServerLogger>,
     ) -> Arc<ComputePipeline> {
         let mut kernel_id = kernel.id();
         kernel_id.mode(mode);
@@ -78,13 +120,13 @@ impl WgpuServer {
         let mut compiler = compiler(self.backend);
         let mut compile = compiler.compile(self, kernel, mode);
 
-        if logger.compilation_activated() {
+        if self.scheduler.logger.compilation_activated() {
             compile.debug_info = Some(DebugInformation::new(
                 compiler.lang_tag(),
                 kernel_id.clone(),
             ));
         }
-        logger.log_compilation(&compile);
+        self.scheduler.logger.log_compilation(&compile);
         // /!\ Do not delete the following commented code.
         // This is useful while working on the metal compiler.
         // Also the errors are printed nicely which is not the case when this is the runtime
@@ -117,29 +159,102 @@ impl WgpuServer {
 impl ComputeServer for WgpuServer {
     type Kernel = Box<dyn CubeTask<AutoCompiler>>;
     type Storage = WgpuStorage;
-    type Feature = Feature;
     type Info = wgpu::Backend;
 
-    fn read(&mut self, bindings: Vec<Binding>) -> DynFut<Vec<Vec<u8>>> {
-        self.stream.read_buffers(bindings)
+    fn logger(&self) -> Arc<ServerLogger> {
+        self.scheduler.logger.clone()
     }
 
-    fn get_resource(&mut self, binding: Binding) -> BindingResource<WgpuResource> {
-        let resource = self.stream.mem_manage.get_resource(binding.clone());
+    fn create(
+        &mut self,
+        descriptors: Vec<AllocationDescriptor<'_>>,
+        stream_id: StreamId,
+    ) -> Result<Vec<Allocation>, IoError> {
+        let align = self.device.limits().min_storage_buffer_offset_alignment as usize;
+        let strides = descriptors
+            .iter()
+            .map(|desc| contiguous_strides(desc.shape))
+            .collect::<Vec<_>>();
+        let sizes = descriptors
+            .iter()
+            .map(|desc| desc.shape.iter().product::<usize>() * desc.elem_size)
+            .collect::<Vec<_>>();
+        let total_size = sizes
+            .iter()
+            .map(|it| it.next_multiple_of(align))
+            .sum::<usize>();
+
+        let stream = self.scheduler.stream(&stream_id);
+        let mem_handle = stream.empty(total_size as u64, stream_id)?;
+        let handles = offset_handles(mem_handle, &sizes, align);
+
+        Ok(handles
+            .into_iter()
+            .zip(strides)
+            .map(|(handle, strides)| Allocation::new(handle, strides))
+            .collect())
+    }
+
+    fn read<'a>(
+        &mut self,
+        descriptors: Vec<CopyDescriptor<'a>>,
+        stream_id: StreamId,
+    ) -> DynFut<Result<Vec<Bytes>, IoError>> {
+        let mut streams = vec![stream_id];
+        let mut resources = Vec::with_capacity(descriptors.len());
+        for desc in descriptors {
+            if contiguous_strides(desc.shape) != desc.strides {
+                return Box::pin(async { Err(IoError::UnsupportedStrides) });
+            }
+            if !streams.contains(&desc.binding.stream) {
+                streams.push(desc.binding.stream);
+            }
+            let stream = self.scheduler.stream(&desc.binding.stream);
+            let resource = stream.mem_manage.get_resource(desc.binding);
+            resources.push((resource, desc.shape.to_vec(), desc.elem_size));
+        }
+
+        self.scheduler.execute_streams(streams);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.read_resources(resources)
+    }
+
+    fn write(
+        &mut self,
+        descriptors: Vec<(CopyDescriptor<'_>, &[u8])>,
+        stream_id: StreamId,
+    ) -> Result<(), IoError> {
+        for (desc, data) in descriptors {
+            if contiguous_strides(desc.shape) != desc.strides {
+                return Err(IoError::UnsupportedStrides);
+            }
+
+            let stream = self.scheduler.stream(&desc.binding.stream);
+            let resource = stream.mem_manage.get_resource(desc.binding.clone());
+            let task = ScheduleTask::Write {
+                data: data.to_vec(),
+                buffer: resource,
+            };
+
+            self.scheduler.register(stream_id, task, [].into_iter());
+        }
+
+        Ok(())
+    }
+
+    fn get_resource(
+        &mut self,
+        binding: Binding,
+        stream_id: StreamId,
+    ) -> BindingResource<WgpuResource> {
+        let mut streams = vec![stream_id];
+        if binding.stream != stream_id {
+            streams.push(binding.stream);
+        }
+        self.scheduler.execute_streams(streams);
+        let stream = self.scheduler.stream(&binding.stream);
+        let resource = stream.mem_manage.get_resource(binding.clone());
         BindingResource::new(binding, resource)
-    }
-
-    /// When we create a new handle from existing data, we use custom allocations so that we don't
-    /// have to execute the current pending tasks.
-    ///
-    /// This is important, otherwise the compute passes are going to be too small and we won't be able to
-    /// fully utilize the GPU.
-    fn create(&mut self, data: &[u8]) -> server::Handle {
-        self.stream.create(data)
-    }
-
-    fn empty(&mut self, size: usize) -> server::Handle {
-        self.stream.empty(size as u64)
     }
 
     unsafe fn execute(
@@ -148,93 +263,68 @@ impl ComputeServer for WgpuServer {
         count: CubeCount,
         bindings: Bindings,
         mode: ExecutionMode,
-        logger: Arc<ServerLogger>,
+        stream_id: StreamId,
     ) {
-        let pipeline = self.pipeline(kernel, mode, logger);
-        self.stream.register(pipeline, bindings, &count);
+        let pipeline = self.pipeline(kernel, mode);
+        let buffers = bindings.buffers.clone();
+        let resources = self.prepare_bindings(bindings);
+        let task = ScheduleTask::Execute {
+            pipeline,
+            count,
+            resources,
+        };
+
+        self.scheduler.register(stream_id, task, buffers.iter());
     }
 
-    fn flush(&mut self) {
-        // End the current compute pass.
-        self.stream.flush();
+    fn flush(&mut self, stream_id: StreamId) {
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.flush()
     }
 
     /// Returns the total time of GPU work this sync completes.
-    fn sync(&mut self) -> DynFut<()> {
-        self.stream.sync()
+    fn sync(&mut self, stream_id: StreamId) -> DynFut<()> {
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.sync()
     }
 
-    fn start_profile(&mut self) -> ProfilingToken {
-        self.stream.start_profile()
+    fn start_profile(&mut self, stream_id: StreamId) -> ProfilingToken {
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.start_profile()
     }
 
-    fn end_profile(&mut self, token: ProfilingToken) -> Result<ProfileDuration, ProfileError> {
-        self.stream.end_profile(token)
-    }
-
-    fn memory_usage(&self) -> cubecl_runtime::memory_management::MemoryUsage {
-        self.stream.mem_manage.memory_usage()
-    }
-
-    fn memory_cleanup(&mut self) {
-        self.stream.mem_manage.memory_cleanup(true);
-    }
-
-    fn read_tensor(&mut self, bindings: Vec<BindingWithMeta>) -> DynFut<Vec<Vec<u8>>> {
-        let expected_sizes = bindings
-            .iter()
-            .map(|it| it.shape.iter().product::<usize>() * it.elem_size)
-            .collect::<Vec<_>>();
-        let bindings = bindings.into_iter().map(|it| it.binding).collect();
-        let data = self.read(bindings);
-        Box::pin(async move {
-            let mut data = data.await;
-            for (data, expected_size) in data.iter_mut().zip(expected_sizes) {
-                data.truncate(expected_size);
-            }
-            data
-        })
-    }
-
-    fn create_tensors(
+    fn end_profile(
         &mut self,
-        data: Vec<&[u8]>,
-        shapes: Vec<&[usize]>,
-        elem_size: Vec<usize>,
-    ) -> Vec<(Handle, Vec<usize>)> {
-        let handles_strides = self.empty_tensors(shapes.clone(), elem_size);
-
-        for i in 0..data.len() {
-            let data = data[i];
-            let (handle, _) = &handles_strides[i];
-            self.stream.copy_to_handle(handle.clone(), data);
-        }
-
-        handles_strides
+        stream_id: StreamId,
+        token: ProfilingToken,
+    ) -> Result<ProfileDuration, ProfileError> {
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.end_profile(token)
     }
 
-    fn empty_tensors(
+    fn memory_usage(
         &mut self,
-        shape: Vec<&[usize]>,
-        elem_size: Vec<usize>,
-    ) -> Vec<(Handle, Vec<usize>)> {
-        let align = self.device.limits().min_storage_buffer_offset_alignment as usize;
-        let strides = shape
-            .iter()
-            .map(|shape| contiguous_strides(shape))
-            .collect::<Vec<_>>();
-        let sizes = shape
-            .iter()
-            .map(|it| it.iter().product::<usize>())
-            .zip(elem_size)
-            .map(|(size, elem_size)| (size * elem_size).next_multiple_of(align))
-            .collect::<Vec<_>>();
-        let total_size = sizes.iter().sum::<usize>();
+        stream_id: StreamId,
+    ) -> cubecl_runtime::memory_management::MemoryUsage {
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.mem_manage.memory_usage()
+    }
 
-        let mem_handle = self.empty(total_size);
-        let handles = offset_handles(mem_handle, &sizes);
+    fn memory_cleanup(&mut self, stream_id: StreamId) {
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.mem_manage.memory_cleanup(true);
+    }
 
-        handles.into_iter().zip(strides).collect()
+    fn allocation_mode(&mut self, mode: MemoryAllocationMode, stream_id: StreamId) {
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.mem_manage.mode(mode);
     }
 }
 

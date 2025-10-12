@@ -1,62 +1,66 @@
 use cubecl_core::{CubeDim, Runtime, client::ComputeClient};
 
 use crate::components::{
-    Ident, InputIdent, LoadingPrecomputeStrategy, MatmulPrecision, MatrixLayout,
+    LoadingPrecomputeStrategy, MatmulIdent, MatmulPrecision, MatrixLayout,
     error::MatmulSetupError,
     global::{
         GlobalConfig, PlaneRoleConfig, SpecializedLoadingSides,
-        load::{LoaderMode, LoadingValidation},
         multi_stage::EventLoadingMode,
+        read::{LoadingValidation, ReaderMode},
         shared::shared_global_config_validation,
     },
-    stage::{self},
+    stage::{StageConfig, StageMemoryConfig},
 };
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 /// Configuration for the double buffering global matmul
-pub struct DoubleBufferingGlobalConfig<S: stage::StageConfig> {
+pub struct DoubleBufferingGlobalConfig<S: StageConfig> {
     pub stage_config: S,
     num_planes: u32,
     pub check_m_bounds: bool,
     pub check_n_bounds: bool,
     pub check_k_bounds: bool,
     precompute_job: LoadingPrecomputeStrategy,
-    loader_mode: LoaderMode,
+    reader_mode: ReaderMode,
     specialized_loading_sides: SpecializedLoadingSides,
 }
 
-impl<S: stage::StageConfig> GlobalConfig for DoubleBufferingGlobalConfig<S> {
+impl<S: StageConfig> GlobalConfig for DoubleBufferingGlobalConfig<S> {
     type StageConfig = S;
+
+    fn stage_memory_config(&self, ident: MatmulIdent) -> StageMemoryConfig {
+        self.stage_config.stage_memory_config(ident.into_stage())
+    }
 
     fn stage_config(&self) -> Self::StageConfig {
         self.stage_config
     }
 
-    fn global_line_size<I: Into<Ident>>(&self, ident: I) -> u32 {
-        self.stage_config.global_line_size(ident)
+    fn global_line_size(&self, ident: MatmulIdent) -> u32 {
+        self.stage_config.global_line_size(ident.into_stage())
     }
 
-    fn matrix_layout<I: Into<Ident>>(&self, ident: I) -> MatrixLayout {
-        self.stage_config.matrix_layout(ident)
+    fn matrix_layout(&self, ident: MatmulIdent) -> MatrixLayout {
+        self.stage_config.matrix_layout(ident.into_stage())
     }
 
     fn plane_dim(&self) -> u32 {
         self.stage_config.plane_dim()
     }
 
-    fn check_row_bounds<I: Into<Ident>>(&self, ident: I) -> bool {
-        match ident.into() {
-            Ident::Lhs => self.check_m_bounds,
-            Ident::Rhs => self.check_k_bounds,
-            Ident::Out => self.check_m_bounds,
+    fn check_row_bounds(&self, ident: MatmulIdent) -> bool {
+        match ident {
+            MatmulIdent::Lhs => self.check_m_bounds,
+            MatmulIdent::Rhs => self.check_k_bounds,
+            MatmulIdent::Out => self.check_m_bounds,
         }
     }
 
-    fn check_col_bounds<I: Into<Ident>>(&self, ident: I) -> bool {
-        match ident.into() {
-            Ident::Lhs => self.check_k_bounds,
-            Ident::Rhs => self.check_n_bounds,
-            Ident::Out => self.check_n_bounds,
+    fn check_col_bounds(&self, ident: MatmulIdent) -> bool {
+        match ident {
+            MatmulIdent::Lhs => self.check_k_bounds,
+            MatmulIdent::Rhs => self.check_n_bounds,
+            MatmulIdent::Out => self.check_n_bounds,
         }
     }
 
@@ -68,15 +72,15 @@ impl<S: stage::StageConfig> GlobalConfig for DoubleBufferingGlobalConfig<S> {
         self.precompute_job.into()
     }
 
-    fn num_stages(&self, _ident: InputIdent) -> u32 {
+    fn num_stages(&self, _ident: MatmulIdent) -> u32 {
         2
     }
 
-    fn loader_mode(&self) -> LoaderMode {
-        self.loader_mode
+    fn reader_mode(&self) -> ReaderMode {
+        self.reader_mode
     }
 
-    fn event_loading_mode(&self, _ident: InputIdent) -> EventLoadingMode {
+    fn event_loading_mode(&self, _ident: MatmulIdent) -> EventLoadingMode {
         EventLoadingMode::Relaxed
     }
 
@@ -84,10 +88,10 @@ impl<S: stage::StageConfig> GlobalConfig for DoubleBufferingGlobalConfig<S> {
         self.stage_config.plane_role_config()
     }
 
-    fn num_loading_planes<I: Into<Ident>>(&self, ident: I) -> u32 {
+    fn num_loading_planes(&self, ident: MatmulIdent) -> u32 {
         self.specialized_loading_sides.num_loading_planes(
             self.plane_role_config().has_specialization(),
-            ident.into().as_input_ident(),
+            ident,
             self.plane_role_config().plane_roles,
         )
     }
@@ -101,12 +105,12 @@ impl<S: stage::StageConfig> GlobalConfig for DoubleBufferingGlobalConfig<S> {
     }
 }
 
-impl<S: stage::StageConfig> DoubleBufferingGlobalConfig<S> {
+impl<S: StageConfig> DoubleBufferingGlobalConfig<S> {
     #[allow(clippy::too_many_arguments)]
     /// Create a new config for double buffering global matmul
     ///
     /// May return an error if:
-    /// - a loader is invalid
+    /// - a reader is invalid
     /// - CubeDim is too big
     pub fn new<LL: LoadingValidation, RL: LoadingValidation, MP: MatmulPrecision, R: Runtime>(
         _client: &ComputeClient<R::Server, R::Channel>,
@@ -116,7 +120,7 @@ impl<S: stage::StageConfig> DoubleBufferingGlobalConfig<S> {
         check_n_bounds: bool,
         check_k_bounds: bool,
         precompute_job: LoadingPrecomputeStrategy,
-        loader_mode: LoaderMode,
+        reader_mode: ReaderMode,
         specialized_loading_sides: SpecializedLoadingSides,
     ) -> Result<Self, MatmulSetupError> {
         Self {
@@ -126,7 +130,7 @@ impl<S: stage::StageConfig> DoubleBufferingGlobalConfig<S> {
             check_n_bounds,
             check_k_bounds,
             precompute_job,
-            loader_mode,
+            reader_mode,
             specialized_loading_sides,
         }
         .validate::<LL, RL>()
@@ -135,8 +139,8 @@ impl<S: stage::StageConfig> DoubleBufferingGlobalConfig<S> {
     fn validate<LL: LoadingValidation, RL: LoadingValidation>(
         self,
     ) -> Result<Self, MatmulSetupError> {
-        LL::check::<Self>(&self, Ident::Lhs)?;
-        RL::check::<Self>(&self, Ident::Rhs)?;
+        LL::check::<Self>(&self, MatmulIdent::Lhs)?;
+        RL::check::<Self>(&self, MatmulIdent::Rhs)?;
         shared_global_config_validation(self)?;
 
         Ok(self)

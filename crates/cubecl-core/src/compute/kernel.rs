@@ -6,7 +6,7 @@ use std::{
 
 use crate::{Compiler, KernelOptions};
 use cubecl_common::{CubeDim, ExecutionMode};
-use cubecl_ir::{Elem, Id, Item, Scope};
+use cubecl_ir::{Id, Scope, StorageType, Type};
 use cubecl_runtime::{
     config::{GlobalConfig, compilation::CompilationLogLevel},
     id::{KernelId, format_str},
@@ -156,7 +156,7 @@ source:
 #[allow(missing_docs)]
 pub struct KernelDefinition {
     pub buffers: Vec<Binding>,
-    pub tensor_maps: Vec<Id>,
+    pub tensor_maps: Vec<Binding>,
     pub scalars: Vec<ScalarBinding>,
     pub cube_dim: CubeDim,
     pub body: Scope,
@@ -169,7 +169,7 @@ pub struct Binding {
     pub id: Id,
     pub location: Location,
     pub visibility: Visibility,
-    pub item: Item,
+    pub ty: Type,
     pub size: Option<usize>,
     pub has_extended_meta: bool,
 }
@@ -177,7 +177,7 @@ pub struct Binding {
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[allow(missing_docs)]
 pub struct ScalarBinding {
-    pub elem: Elem,
+    pub ty: StorageType,
     pub count: usize,
 }
 

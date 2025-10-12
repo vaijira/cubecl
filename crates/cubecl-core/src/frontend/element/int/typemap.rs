@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use core::ops::*;
-use cubecl_ir::{Elem, ExpandElement, IntKind, Scope, Variable};
+use cubecl_ir::{ElemType, ExpandElement, IntKind, Scope, StorageType, Variable};
 use derive_more::derive::{
     Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Display, Div,
     DivAssign, Mul, MulAssign, Neg, Not, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub,
@@ -9,11 +9,7 @@ use derive_more::derive::{
 use num_traits::{NumCast, ToPrimitive};
 use serde::Serialize;
 
-use crate::{
-    Runtime,
-    compute::{KernelBuilder, KernelLauncher},
-    prelude::*,
-};
+use crate::{Runtime, compute::KernelLauncher, prelude::*};
 
 use super::{Int, into_mut_expand_element};
 
@@ -142,8 +138,8 @@ impl<const POS: u8> CubeType for IntExpand<POS> {
 
 impl<const POS: u8> CubePrimitive for IntExpand<POS> {
     /// Return the element type to use on GPU
-    fn as_elem(scope: &Scope) -> Elem {
-        scope.resolve_elem::<Self>().expect("Type to be registered")
+    fn as_type(scope: &Scope) -> StorageType {
+        scope.resolve_type::<Self>().expect("Type to be registered")
     }
 }
 
@@ -155,7 +151,7 @@ impl<const POS: u8> From<IntExpand<POS>> for Variable {
                 val.0,
                 cubecl_ir::IntKind::I32,
             )),
-            crate::ir::Item::new(Elem::Int(IntKind::I64)),
+            crate::ir::Type::scalar(ElemType::Int(IntKind::I64)),
         )
     }
 }
@@ -201,22 +197,14 @@ impl<const POS: u8> ReverseBits for IntExpand<POS> {}
 impl<const POS: u8> CountOnes for IntExpand<POS> {}
 impl<const POS: u8> FindFirstSet for IntExpand<POS> {}
 impl<const POS: u8> LeadingZeros for IntExpand<POS> {}
+impl<const POS: u8> SaturatingAdd for IntExpand<POS> {}
+impl<const POS: u8> SaturatingSub for IntExpand<POS> {}
 
 impl<const POS: u8> Int for IntExpand<POS> {
     const BITS: u32 = 32;
 
     fn new(val: i64) -> Self {
         IntExpand(val)
-    }
-}
-
-impl<const POS: u8> LaunchArgExpand for IntExpand<POS> {
-    type CompilationArg = ();
-
-    fn expand(_: &Self::CompilationArg, builder: &mut KernelBuilder) -> ExpandElementTyped<Self> {
-        builder
-            .scalar(IntExpand::<POS>::as_elem(&builder.scope))
-            .into()
     }
 }
 

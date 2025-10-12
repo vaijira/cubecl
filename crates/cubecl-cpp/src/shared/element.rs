@@ -1,5 +1,8 @@
-use cubecl_common::{e2m1x2, e3m2, e5m2};
-use cubecl_core::tf32;
+use cubecl_common::{e2m1, e2m1x2, e3m2, e5m2};
+use cubecl_core::{
+    ir::{ElemType, FloatKind, IntKind, UIntKind},
+    tf32,
+};
 use half::{bf16, f16};
 use std::fmt::Display;
 
@@ -90,7 +93,7 @@ impl<D: Dialect> Display for Elem<D> {
 impl<D: Dialect> Elem<D> {
     pub const fn size(&self) -> usize {
         match self {
-            Elem::FP4(_) => panic!("Can't get byte size of sub-byte type"),
+            Elem::FP4(_) => core::mem::size_of::<e2m1>(),
             Elem::FP4x2(_) => core::mem::size_of::<e2m1x2>(),
             Elem::FP6(_) => core::mem::size_of::<e3m2>(),
             Elem::FP6x2(_) => 2 * core::mem::size_of::<e3m2>(),
@@ -131,6 +134,54 @@ impl<D: Dialect> Elem<D> {
             other => other.size() * 8,
         }
     }
+
+    pub const fn unpacked(&self) -> Self {
+        match self {
+            Elem::FP4x2(ty) => Elem::FP4(*ty),
+            Elem::FP6x2(ty) => Elem::FP6(*ty),
+            Elem::FP8x2(ty) => Elem::FP8(*ty),
+            Elem::F16x2 => Elem::F16,
+            Elem::BF16x2 => Elem::BF16,
+            elem => *elem,
+        }
+    }
+
+    /// Get the number of values packed into a single storage element. (i.e. `f16x2 -> 2`)
+    pub const fn packing_factor(&self) -> usize {
+        match self {
+            Elem::FP4x2(_) | Elem::FP6x2(_) | Elem::FP8x2(_) | Elem::F16x2 | Elem::BF16x2 => 2,
+            _ => 1,
+        }
+    }
+
+    pub const fn ident(&self) -> &str {
+        match self {
+            Elem::FP4(_) => "fp4",
+            Elem::FP4x2(_) => "fp4x2",
+            Elem::FP6(_) => "fp6",
+            Elem::FP6x2(_) => "fp6x2",
+            Elem::FP8(_) => "fp8",
+            Elem::FP8x2(_) => "fp8x2",
+            Elem::F16 => "f16",
+            Elem::F16x2 => "f16x2",
+            Elem::BF16x2 => "bf16x2",
+            Elem::BF16 => "bf16",
+            Elem::TF32 => "tf32",
+            Elem::F32 => "f32",
+            Elem::F64 => "f64",
+            Elem::I8 => "i8",
+            Elem::I16 => "i16",
+            Elem::I32 => "i32",
+            Elem::I64 => "i64",
+            Elem::U8 => "u8",
+            Elem::U16 => "u16",
+            Elem::U32 => "u32",
+            Elem::U64 => "u64",
+            Elem::Bool => "bool",
+            Elem::Atomic(_) => "atomic",
+            Elem::_Dialect(_) => "",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Hash)]
@@ -145,6 +196,22 @@ pub enum AtomicKind<D: Dialect> {
     F64,
     /// Required to construct the inner `Elem` of the atomic value
     _Dialect(std::marker::PhantomData<D>),
+}
+
+impl<D: Dialect> From<ElemType> for AtomicKind<D> {
+    fn from(value: ElemType) -> Self {
+        match value {
+            ElemType::Float(FloatKind::F16) => AtomicKind::F16,
+            ElemType::Float(FloatKind::BF16) => AtomicKind::BF16,
+            ElemType::Float(FloatKind::F32) => AtomicKind::F32,
+            ElemType::Float(FloatKind::F64) => AtomicKind::F64,
+            ElemType::Int(IntKind::I32) => AtomicKind::I32,
+            ElemType::Int(IntKind::I64) => AtomicKind::I64,
+            ElemType::UInt(UIntKind::U32) => AtomicKind::U32,
+            ElemType::UInt(UIntKind::U64) => AtomicKind::U64,
+            other => unimplemented!("Invalid atomic type: {other}"),
+        }
+    }
 }
 
 impl<D: Dialect> Display for AtomicKind<D> {

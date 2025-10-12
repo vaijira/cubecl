@@ -1,13 +1,13 @@
-use std::{marker::PhantomData, num::NonZero};
+use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     Runtime,
     compute::{KernelBuilder, KernelLauncher},
-    ir::{Id, Item, Vectorization},
+    ir::{Id, LineSize, Type},
     prelude::{
-        ArgSettings, CompilationArg, CubePrimitive, ExpandElementTyped, LaunchArg, LaunchArgExpand,
+        ArgSettings, ArrayArg, CompilationArg, CubePrimitive, ExpandElementTyped, LaunchArg,
     },
 };
 
@@ -21,7 +21,7 @@ pub enum TensorArg<'a, R: Runtime> {
         /// The tensor handle.
         handle: TensorHandleRef<'a, R>,
         /// The vectorization factor.
-        vectorization_factor: u8,
+        line_size: u8,
     },
     /// The tensor is aliasing another input tensor.
     Alias {
@@ -39,6 +39,14 @@ pub struct TensorHandleRef<'a, R: Runtime> {
     pub elem_size: usize,
     pub runtime: PhantomData<R>,
 }
+
+impl<'a, R: Runtime> Clone for TensorHandleRef<'a, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, R: Runtime> Copy for TensorHandleRef<'a, R> {}
 
 impl<R: Runtime> TensorHandleRef<'_, R> {
     pub fn size(&self) -> usize {
@@ -60,23 +68,34 @@ impl<R: Runtime> core::fmt::Debug for TensorHandleRef<'_, R> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct TensorCompilationArg {
     pub inplace: Option<Id>,
-    pub vectorisation: Vectorization,
+    pub line_size: LineSize,
 }
 
 impl CompilationArg for TensorCompilationArg {}
 
-impl<C: CubePrimitive> LaunchArgExpand for Tensor<C> {
+impl<C: CubePrimitive> LaunchArg for Tensor<C> {
+    type RuntimeArg<'a, R: Runtime> = TensorArg<'a, R>;
     type CompilationArg = TensorCompilationArg;
+
+    fn compilation_arg<R: Runtime>(runtime_arg: &Self::RuntimeArg<'_, R>) -> Self::CompilationArg {
+        match runtime_arg {
+            TensorArg::Handle { line_size, .. } => TensorCompilationArg {
+                inplace: None,
+                line_size: *line_size as u32,
+            },
+            TensorArg::Alias { input_pos } => TensorCompilationArg {
+                inplace: Some(*input_pos as Id),
+                line_size: 0,
+            },
+        }
+    }
 
     fn expand(
         arg: &Self::CompilationArg,
         builder: &mut KernelBuilder,
     ) -> ExpandElementTyped<Tensor<C>> {
         builder
-            .input_tensor(Item::vectorized(
-                C::as_elem(&builder.scope),
-                arg.vectorisation,
-            ))
+            .input_tensor(Type::new(C::as_type(&builder.scope)).line(arg.line_size))
             .into()
     }
     fn expand_output(
@@ -86,31 +105,8 @@ impl<C: CubePrimitive> LaunchArgExpand for Tensor<C> {
         match arg.inplace {
             Some(id) => builder.inplace_output(id).into(),
             None => builder
-                .output_tensor(Item::vectorized(
-                    C::as_elem(&builder.scope),
-                    arg.vectorisation,
-                ))
+                .output_tensor(Type::new(C::as_type(&builder.scope)).line(arg.line_size))
                 .into(),
-        }
-    }
-}
-
-impl<C: CubePrimitive> LaunchArg for Tensor<C> {
-    type RuntimeArg<'a, R: Runtime> = TensorArg<'a, R>;
-
-    fn compilation_arg<R: Runtime>(runtime_arg: &Self::RuntimeArg<'_, R>) -> Self::CompilationArg {
-        match runtime_arg {
-            TensorArg::Handle {
-                vectorization_factor,
-                ..
-            } => TensorCompilationArg {
-                inplace: None,
-                vectorisation: Vectorization::Some(NonZero::new(*vectorization_factor).unwrap()),
-            },
-            TensorArg::Alias { input_pos } => TensorCompilationArg {
-                inplace: Some(*input_pos as Id),
-                vectorisation: Vectorization::None,
-            },
         }
     }
 }
@@ -136,7 +132,7 @@ impl<'a, R: Runtime> TensorArg<'a, R> {
                     shape,
                     E::size().expect("Element should have a size"),
                 ),
-                vectorization_factor: factor,
+                line_size: factor,
             }
         }
     }
@@ -158,7 +154,7 @@ impl<'a, R: Runtime> TensorArg<'a, R> {
         unsafe {
             Self::Handle {
                 handle: TensorHandleRef::from_raw_parts(handle, strides, shape, elem_size),
-                vectorization_factor: factor,
+                line_size: factor,
             }
         }
     }
@@ -189,6 +185,11 @@ impl<'a, R: Runtime> TensorHandleRef<'a, R> {
                 self.elem_size,
             )
         }
+    }
+    /// Convert the handle into an [array argument](ArrayArg).
+    pub fn as_array_arg(&'a self, line_size: u8) -> ArrayArg<'a, R> {
+        let length = self.shape.iter().product();
+        unsafe { ArrayArg::from_raw_parts_and_size(self.handle, length, line_size, self.elem_size) }
     }
     /// Create a handle from raw parts.
     ///

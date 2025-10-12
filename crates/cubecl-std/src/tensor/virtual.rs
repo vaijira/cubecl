@@ -3,17 +3,20 @@ use core::marker::PhantomData;
 use cubecl::prelude::{CubeType, Scope, *};
 use cubecl_core::{self as cubecl, unexpanded};
 
-/// The read tag for [virtual tensor](VirtualTensor).
-#[derive(Clone)]
-pub struct Read;
-
-/// The read write tag for [virtual tensor](VirtualTensor).
-#[derive(Clone)]
-pub struct ReadWrite;
+use crate::{
+    CubeOption,
+    tensor::{
+        ViewExpand,
+        layout::{
+            Coordinates, Coords1d, Layout, VirtualLayout, VirtualLayoutExpand, simple::SimpleLayout,
+        },
+        view::View,
+    },
+};
 
 /// Tensor representation that is decoupled from how the tensor is stored.
 #[derive(Clone)]
-pub struct VirtualTensor<E: Numeric, IO = Read> {
+pub struct VirtualTensor<E: Numeric, IO = ReadOnly> {
     // state: Arc<dyn VirtualTensorOperations<E>>,
     _e: PhantomData<E>,
     _p: PhantomData<IO>,
@@ -54,11 +57,43 @@ impl<E: Numeric, IO: Clone> ListExpand<Line<E>> for VirtualTensorExpand<E, IO> {
     ) -> <Line<E> as CubeType>::ExpandType {
         todo!("VirtualTensor don't support read unchecked yet");
     }
+
+    fn __expand_len_method(&self, scope: &mut Scope) -> ExpandElementTyped<u32> {
+        self.state.clone().__expand_len_method(scope)
+    }
+}
+
+impl<E: Numeric, IO: Clone> Lined for VirtualTensor<E, IO> {}
+impl<E: Numeric, IO: Clone> LinedExpand for VirtualTensorExpand<E, IO> {
+    fn line_size(&self) -> u32 {
+        self.state.clone().line_size()
+    }
+}
+
+impl<E: Numeric, IO: Clone> SliceOperator<Line<E>> for VirtualTensor<E, IO> {}
+impl<E: Numeric, IO: Clone> SliceOperatorExpand<Line<E>> for VirtualTensorExpand<E, IO> {
+    fn __expand_slice_method(
+        &self,
+        scope: &mut Scope,
+        start: ExpandElementTyped<u32>,
+        end: ExpandElementTyped<u32>,
+    ) -> SliceExpand<Line<E>, ReadOnly> {
+        self.state
+            .clone()
+            .__expand_read_window_method(scope, start, end)
+    }
+
+    fn __expand_to_slice_method(&self, scope: &mut Scope) -> SliceExpand<Line<E>, ReadOnly> {
+        let end = self.clone().__expand_buffer_len_method(scope);
+        self.state
+            .clone()
+            .__expand_read_window_method(scope, 0.into(), end)
+    }
 }
 
 #[allow(unused, clippy::all)]
 impl<E: Numeric, IO: Clone> VirtualTensor<E, IO> {
-    pub fn as_tensor_map(&self) -> TensorMap<E> {
+    pub fn as_tensor_map(&self) -> CubeOption<TensorMap<E>> {
         unexpanded!()
     }
     pub fn as_slice(&self, start: u32, end: u32) -> Slice<Line<E>> {
@@ -77,10 +112,6 @@ impl<E: Numeric, IO: Clone> VirtualTensor<E, IO> {
         unexpanded!();
     }
 
-    pub fn len(&self) -> u32 {
-        unexpanded!();
-    }
-
     pub fn buffer_len(&self) -> u32 {
         unexpanded!();
     }
@@ -88,7 +119,7 @@ impl<E: Numeric, IO: Clone> VirtualTensor<E, IO> {
     pub fn __expand_as_tensor_map(
         context: &mut Scope,
         this: <Self as CubeType>::ExpandType,
-    ) -> <TensorMap<E> as CubeType>::ExpandType {
+    ) -> <CubeOption<TensorMap<E>> as CubeType>::ExpandType {
         this.__expand_as_tensor_map_method(context)
     }
     pub fn __expand_as_slice(
@@ -119,12 +150,6 @@ impl<E: Numeric, IO: Clone> VirtualTensor<E, IO> {
     ) -> <u32 as CubeType>::ExpandType {
         this.__expand_rank_method(scope)
     }
-    pub fn __expand_len(
-        scope: &mut Scope,
-        this: <Self as CubeType>::ExpandType,
-    ) -> <u32 as CubeType>::ExpandType {
-        this.__expand_len_method(scope)
-    }
     pub fn __expand_buffer_len(
         scope: &mut Scope,
         this: <Self as CubeType>::ExpandType,
@@ -138,7 +163,7 @@ impl<E: Numeric, IO: Clone> VirtualTensorExpand<E, IO> {
     pub fn __expand_as_tensor_map_method(
         self,
         context: &mut Scope,
-    ) -> <TensorMap<E> as CubeType>::ExpandType {
+    ) -> <CubeOption<TensorMap<E>> as CubeType>::ExpandType {
         self.state.clone().__expand_as_tensor_map_method(context)
     }
 
@@ -179,10 +204,6 @@ impl<E: Numeric, IO: Clone> VirtualTensorExpand<E, IO> {
         self.state.clone().__expand_rank_method(scope)
     }
 
-    pub fn __expand_len_method(self, scope: &mut Scope) -> <u32 as CubeType>::ExpandType {
-        self.state.clone().__expand_len_method(scope)
-    }
-
     pub fn __expand_buffer_len_method(self, scope: &mut Scope) -> <u32 as CubeType>::ExpandType {
         self.state.clone().__expand_buffer_len_method(scope)
     }
@@ -216,8 +237,83 @@ impl<E: Numeric, IO: Clone> VirtualTensorExpand<E, IO> {
     }
 }
 
+impl<E: Numeric, IO: Clone + 'static> VirtualTensor<E, IO> {
+    /// Create a conceptual view over this tensor, allowing for multi-dimensional indexing with custom
+    /// layouts
+    pub fn view<C: Coordinates + 'static>(
+        &self,
+        layout: impl Into<VirtualLayout<C, Coords1d>>,
+    ) -> View<Line<E>, C, ReadOnly> {
+        View::new::<VirtualTensor<E, IO>, Coords1d>(self, layout)
+    }
+}
+
 #[cube]
-impl<E: Numeric, IO: Clone> VirtualTensor<E, IO> {
+impl<E: Numeric, IO: Clone + 'static> VirtualTensor<E, IO> {
+    /// Create a conceptual view over this tensor, with a simple linear layout
+    pub fn as_view(&self) -> View<Line<E>, u32, ReadOnly> {
+        let line_size = self.line_size();
+        View::new::<VirtualTensor<E, IO>, u32>(
+            self,
+            SimpleLayout::new(self.len() * line_size, line_size),
+        )
+    }
+}
+
+impl<E: Numeric, IO: Clone + 'static> VirtualTensorExpand<E, IO> {
+    /// Create a conceptual view over this tensor, allowing for multi-dimensional indexing with custom
+    /// layouts
+    pub fn __expand_view_method<C: Coordinates + 'static>(
+        &self,
+        scope: &mut Scope,
+        layout: VirtualLayoutExpand<C, Coords1d>,
+    ) -> ViewExpand<Line<E>, C, ReadOnly> {
+        View::__expand_new::<VirtualTensor<E, IO>, Coords1d>(scope, self.clone(), layout)
+    }
+}
+
+impl<E: Numeric> VirtualTensor<E, ReadWrite> {
+    #[doc = " Create a mutable conceptual view over this tensor, allowing for multi-dimensional indexing"]
+    #[doc = " with custom layouts"]
+    pub fn view_mut<C: Coordinates + 'static>(
+        &self,
+        layout: impl Layout<Coordinates = C, SourceCoordinates = Coords1d> + 'static,
+    ) -> View<Line<E>, C, ReadWrite> {
+        let mut this: VirtualTensor<E, ReadWrite> = *self;
+        View::new_mut::<VirtualTensor<E, ReadWrite>, Coords1d>(&mut this, layout)
+    }
+    pub fn __expand_view_mut<C: Coordinates + 'static>(
+        scope: &mut Scope,
+        this: VirtualTensorExpand<E, ReadWrite>,
+        layout: VirtualLayoutExpand<C, Coords1d>,
+    ) -> ViewExpand<Line<E>, C, ReadWrite> {
+        this.__expand_view_mut_method::<C>(scope, layout)
+    }
+}
+impl<E: Numeric> VirtualTensorExpand<E, ReadWrite> {
+    pub fn __expand_view_mut_method<C: Coordinates + 'static>(
+        self,
+        scope: &mut Scope,
+        layout: VirtualLayoutExpand<C, Coords1d>,
+    ) -> ViewExpand<Line<E>, C, ReadWrite> {
+        View::__expand_new_mut::<VirtualTensor<E, ReadWrite>, Coords1d>(scope, self, layout)
+    }
+}
+
+#[cube]
+impl<E: Numeric> VirtualTensor<E, ReadWrite> {
+    /// Create a conceptual mutable view over this tensor, with a simple linear layout
+    pub fn as_view_mut(&mut self) -> View<Line<E>, u32, ReadWrite> {
+        let line_size = self.line_size();
+        View::new_mut::<VirtualTensor<E, ReadWrite>, u32>(
+            self,
+            SimpleLayout::new(self.len() * line_size, line_size),
+        )
+    }
+}
+
+#[cube]
+impl<E: Numeric, IO: Clone + 'static> VirtualTensor<E, IO> {
     pub fn coordinate(&self, index: u32, dim: u32) -> u32 {
         let num_strides = index / self.stride(dim);
         num_strides % self.shape(dim)
@@ -248,18 +344,38 @@ impl<E: Numeric> ListMutExpand<Line<E>> for VirtualTensorExpand<E, ReadWrite> {
     }
 }
 
-impl<E: Numeric> VirtualTensor<E, Read> {
+impl<E: Numeric> SliceMutOperator<Line<E>> for VirtualTensor<E, ReadWrite> {}
+impl<E: Numeric> SliceMutOperatorExpand<Line<E>> for VirtualTensorExpand<E, ReadWrite> {
+    #[allow(unused_variables)]
+    fn __expand_slice_mut_method(
+        &self,
+        scope: &mut Scope,
+        start: ExpandElementTyped<u32>,
+        end: ExpandElementTyped<u32>,
+    ) -> SliceExpand<Line<E>, cubecl_core::prelude::ReadWrite> {
+        todo!("VirtualTensor don't support slice mut yet");
+    }
+
+    #[allow(unused_variables)]
+    fn __expand_to_slice_mut_method(
+        &self,
+        scope: &mut Scope,
+    ) -> SliceExpand<Line<E>, cubecl_core::prelude::ReadWrite> {
+        todo!("VirtualTensor don't support slice mut yet");
+    }
+}
+
+impl<E: Numeric> VirtualTensor<E, ReadOnly> {
     /// Create a new [read only](Read) [virtual tensor](VirtualTensor).
     pub fn new<V: VirtualTensorOperations<E> + 'static>(_v: &V) -> Self {
         unexpanded!()
     }
 
     /// Expand function of [Self::new].
-    pub fn __expand_new<V>(_scope: &mut Scope, v: V::ExpandType) -> VirtualTensorExpand<E, Read>
-    where
-        V::ExpandType: VirtualTensorOperationsExpand<E>,
-        V: VirtualTensorOperations<E> + CubeType + 'static,
-    {
+    pub fn __expand_new<V: VirtualTensorOperations<E> + 'static>(
+        _scope: &mut Scope,
+        v: V::ExpandType,
+    ) -> VirtualTensorExpand<E, ReadOnly> {
         VirtualTensorExpand {
             state: Arc::new(v),
             _p: PhantomData,
@@ -274,14 +390,10 @@ impl<E: Numeric> VirtualTensor<E, ReadWrite> {
     }
 
     /// Expand function of [Self::new].
-    pub fn __expand_new<V>(
+    pub fn __expand_new<V: VirtualTensorOperations<E> + 'static>(
         _scope: &mut Scope,
         v: V::ExpandType,
-    ) -> VirtualTensorExpand<E, ReadWrite>
-    where
-        V::ExpandType: VirtualTensorOperationsExpand<E>,
-        V: VirtualTensorOperations<E> + CubeType + 'static,
-    {
+    ) -> VirtualTensorExpand<E, ReadWrite> {
         VirtualTensorExpand {
             state: Arc::new(v),
             _p: PhantomData,
@@ -298,9 +410,16 @@ impl<E: Numeric> VirtualTensor<E, ReadWrite> {
 ///
 /// This trait is kind of unsafe, [VirtualTensorOperations::write] doesn't follow the mutability
 /// rules, but it won't lead to any undefined behavior.
-pub trait VirtualTensorOperations<E: Numeric> {
+#[cube(self_type = "ref", expand_base_traits = "LinedExpand")]
+pub trait VirtualTensorOperations<E: Numeric>: Lined {
+    fn as_tensor_map(&self) -> CubeOption<TensorMap<E>> {
+        unexpanded!()
+    }
     /// Read the tensor at the given index.
     fn read(&self, _index: u32) -> Line<E> {
+        unexpanded!()
+    }
+    fn read_window(&self, _start: u32, _end: u32) -> Slice<Line<E>, ReadOnly> {
         unexpanded!()
     }
     /// Write the tensor at the given index.
@@ -319,44 +438,12 @@ pub trait VirtualTensorOperations<E: Numeric> {
     fn rank(&self) -> u32 {
         unexpanded!()
     }
-}
-
-/// Expand trait for [VirtualTensorOperations].
-///
-/// For now this needs to be manually implemented for any type that needs to become a virtual
-/// tensor.
-pub trait VirtualTensorOperationsExpand<E: Numeric> {
-    fn __expand_as_tensor_map_method(&self, scope: &mut Scope) -> ExpandElementTyped<TensorMap<E>>;
-    fn __expand_read_method(
-        &self,
-        scope: &mut Scope,
-        index: ExpandElementTyped<u32>,
-    ) -> ExpandElementTyped<Line<E>>;
-    fn __expand_read_window_method(
-        &self,
-        context: &mut Scope,
-        start: ExpandElementTyped<u32>,
-        end: ExpandElementTyped<u32>,
-    ) -> SliceExpand<Line<E>, ReadOnly>;
-    fn __expand_write_method(
-        &self,
-        scope: &mut Scope,
-        index: ExpandElementTyped<u32>,
-        value: ExpandElementTyped<Line<E>>,
-    );
-    fn __expand_shape_method(
-        &self,
-        scope: &mut Scope,
-        axis: ExpandElementTyped<u32>,
-    ) -> ExpandElementTyped<u32>;
-    fn __expand_stride_method(
-        &self,
-        scope: &mut Scope,
-        axis: ExpandElementTyped<u32>,
-    ) -> ExpandElementTyped<u32>;
-    fn __expand_rank_method(&self, scope: &mut Scope) -> ExpandElementTyped<u32>;
-    fn __expand_len_method(&self, scope: &mut Scope) -> ExpandElementTyped<u32>;
-    fn __expand_buffer_len_method(&self, scope: &mut Scope) -> ExpandElementTyped<u32>;
+    fn len(&self) -> u32 {
+        unexpanded!()
+    }
+    fn buffer_len(&self) -> u32 {
+        unexpanded!()
+    }
 }
 
 /// Making [virtual tensors](VirtualTensor) a proper [cube type](CubeType).
@@ -378,6 +465,8 @@ mod __cube_type {
 
 /// Enable tensors to be virtual.
 mod __tensor {
+    use crate::CubeOptionExpand;
+
     use super::*;
 
     impl<E: Numeric> VirtualTensorOperations<E> for Tensor<Line<E>> {}
@@ -436,15 +525,17 @@ mod __tensor {
 
         fn __expand_as_tensor_map_method(
             &self,
-            _scope: &mut Scope,
-        ) -> ExpandElementTyped<TensorMap<E>> {
-            unimplemented!("Can't turn normal tensor into `TensorMap`");
+            scope: &mut Scope,
+        ) -> CubeOptionExpand<TensorMap<E>> {
+            CubeOption::__expand_new_None(scope)
         }
     }
 }
 
 /// Enable tensor maps to be virtual.
 mod __tensor_map {
+    use crate::CubeOptionExpand;
+
     use super::*;
 
     impl<E: Numeric> VirtualTensorOperations<E> for TensorMap<E> {}
@@ -502,9 +593,9 @@ mod __tensor_map {
 
         fn __expand_as_tensor_map_method(
             &self,
-            _scope: &mut Scope,
-        ) -> ExpandElementTyped<TensorMap<E>> {
-            self.clone()
+            scope: &mut Scope,
+        ) -> CubeOptionExpand<TensorMap<E>> {
+            CubeOption::__expand_new_Some(scope, self.clone())
         }
     }
 }

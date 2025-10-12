@@ -10,7 +10,7 @@ use crate::{
 use cubecl_core::ir::{self, ConstantScalarValue, FloatKind, Id};
 use rspirv::{
     dr::Builder,
-    spirv::{StorageClass, Word},
+    spirv::{FPEncoding, StorageClass, Word},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,11 +96,20 @@ impl ConstVal {
         }
     }
 
-    pub fn as_float(&self, width: u32) -> f64 {
-        match width {
-            64 => f64::from_bits(self.as_u64()),
-            32 => f32::from_bits(self.as_u32()) as f64,
-            16 => half::f16::from_bits(self.as_u32() as u16).to_f64(),
+    pub fn as_float(&self, width: u32, encoding: Option<FPEncoding>) -> f64 {
+        match (width, encoding) {
+            (64, _) => f64::from_bits(self.as_u64()),
+            (32, _) => f32::from_bits(self.as_u32()) as f64,
+            (16, None) => half::f16::from_bits(self.as_u32() as u16).to_f64(),
+            (_, Some(FPEncoding::BFloat16KHR)) => {
+                half::bf16::from_bits(self.as_u32() as u16).to_f64()
+            }
+            (_, Some(FPEncoding::Float8E4M3EXT)) => {
+                cubecl_common::e4m3::from_bits(self.as_u32() as u8).to_f64()
+            }
+            (_, Some(FPEncoding::Float8E5M2EXT)) => {
+                cubecl_common::e5m2::from_bits(self.as_u32() as u8).to_f64()
+            }
             _ => unreachable!(),
         }
     }
@@ -117,11 +126,20 @@ impl ConstVal {
         }
     }
 
-    pub fn from_float(value: f64, width: u32) -> Self {
-        match width {
-            64 => ConstVal::Bit64(value.to_bits()),
-            32 => ConstVal::Bit32((value as f32).to_bits()),
-            16 => ConstVal::Bit32(half::f16::from_f64(value).to_bits() as u32),
+    pub fn from_float(value: f64, width: u32, encoding: Option<FPEncoding>) -> Self {
+        match (width, encoding) {
+            (64, _) => ConstVal::Bit64(value.to_bits()),
+            (32, _) => ConstVal::Bit32((value as f32).to_bits()),
+            (16, None) => ConstVal::Bit32(half::f16::from_f64(value).to_bits() as u32),
+            (_, Some(FPEncoding::BFloat16KHR)) => {
+                ConstVal::Bit32(half::bf16::from_f64(value).to_bits() as u32)
+            }
+            (_, Some(FPEncoding::Float8E4M3EXT)) => {
+                ConstVal::Bit32(cubecl_common::e4m3::from_f64(value).to_bits() as u32)
+            }
+            (_, Some(FPEncoding::Float8E5M2EXT)) => {
+                ConstVal::Bit32(cubecl_common::e5m2::from_f64(value).to_bits() as u32)
+            }
             _ => unreachable!(),
         }
     }
@@ -153,13 +171,19 @@ impl ConstVal {
 
 impl From<ConstantScalarValue> for ConstVal {
     fn from(value: ConstantScalarValue) -> Self {
-        let width = value.elem().size() as u32 * 8;
+        let width = value.elem_type().size() as u32 * 8;
         match value {
             ConstantScalarValue::Int(val, _) => ConstVal::from_int(val, width),
-            ConstantScalarValue::Float(_, FloatKind::BF16) => {
-                panic!("bf16 not supported in SPIR-V")
+            ConstantScalarValue::Float(val, FloatKind::BF16) => {
+                ConstVal::from_float(val, width, Some(FPEncoding::BFloat16KHR))
             }
-            ConstantScalarValue::Float(val, _) => ConstVal::from_float(val, width),
+            ConstantScalarValue::Float(val, FloatKind::E4M3) => {
+                ConstVal::from_float(val, width, Some(FPEncoding::Float8E4M3EXT))
+            }
+            ConstantScalarValue::Float(val, FloatKind::E5M2) => {
+                ConstVal::from_float(val, width, Some(FPEncoding::Float8E5M2EXT))
+            }
+            ConstantScalarValue::Float(val, _) => ConstVal::from_float(val, width, None),
             ConstantScalarValue::UInt(val, _) => ConstVal::from_uint(val, width),
             ConstantScalarValue::Bool(val) => ConstVal::from_bool(val),
         }
@@ -319,10 +343,10 @@ pub enum IndexedVariable {
 
 impl<T: SpirvTarget> SpirvCompiler<T> {
     pub fn compile_variable(&mut self, variable: ir::Variable) -> Variable {
-        let item = variable.item;
+        let item = variable.ty;
         match variable.kind {
             ir::VariableKind::ConstantScalar(value) => {
-                let item = self.compile_item(ir::Item::new(value.elem()));
+                let item = self.compile_type(ir::Type::new(value.storage_type()));
                 let const_val = value.into();
 
                 if let Some(existing) = self.state.constants.get(&(const_val, item.clone())) {
@@ -335,57 +359,44 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             }
             ir::VariableKind::GlobalInputArray(pos) => {
                 let id = self.state.buffers[pos as usize];
-                Variable::GlobalInputArray(id, self.compile_item(item), pos)
+                Variable::GlobalInputArray(id, self.compile_type(item), pos)
             }
             ir::VariableKind::GlobalOutputArray(pos) => {
                 let id = self.state.buffers[pos as usize];
-                Variable::GlobalOutputArray(id, self.compile_item(item), pos)
+                Variable::GlobalOutputArray(id, self.compile_type(item), pos)
             }
-            ir::VariableKind::GlobalScalar(id) => self.global_scalar(id, item.elem),
+            ir::VariableKind::GlobalScalar(id) => self.global_scalar(id, item.storage_type()),
             ir::VariableKind::LocalMut { id } => {
-                let item = self.compile_item(item);
+                let item = self.compile_type(item);
                 let var = self.get_local(id, &item, variable);
                 Variable::Local { id: var, item }
             }
             ir::VariableKind::Versioned { id, version } => {
-                let item = self.compile_item(item);
+                let item = self.compile_type(item);
                 let id = (id, version);
                 Variable::Versioned { id, item, variable }
             }
             ir::VariableKind::LocalConst { id } => {
-                let item = self.compile_item(item);
+                let item = self.compile_type(item);
                 Variable::LocalBinding { id, item, variable }
             }
             ir::VariableKind::Builtin(builtin) => self.compile_builtin(builtin),
-            ir::VariableKind::ConstantArray { id, length } => {
-                let item = self.compile_item(item);
+            ir::VariableKind::ConstantArray { id, length, .. } => {
+                let item = self.compile_type(item);
                 let id = self.state.const_arrays[id as usize].id;
                 Variable::ConstantArray(id, item, length)
             }
-            ir::VariableKind::SharedMemory {
-                id,
-                length,
-                alignment,
-            } => {
-                let item = self.compile_item(item);
-                let id = if let Some(arr) = self.state.shared_memories.get(&id) {
-                    arr.id
-                } else {
-                    let arr_id = self.id();
-                    let arr = Array {
-                        id: arr_id,
-                        item: item.clone(),
-                        len: length,
-                        var: variable,
-                        alignment,
-                    };
-                    self.state.shared_memories.insert(id, arr);
-                    arr_id
-                };
+            ir::VariableKind::SharedMemory { id, length, .. } => {
+                let item = self.compile_type(item);
+                let id = self.state.shared_memories[&id].id;
                 Variable::SharedMemory(id, item, length)
             }
-            ir::VariableKind::LocalArray { id, length } => {
-                let item = self.compile_item(item);
+            ir::VariableKind::LocalArray {
+                id,
+                length,
+                unroll_factor,
+            } => {
+                let item = self.compile_type(item);
                 let id = if let Some(arr) = self.state.local_arrays.get(&id) {
                     arr.id
                 } else {
@@ -396,7 +407,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     let arr = Array {
                         id: arr_id,
                         item: item.clone(),
-                        len: length,
+                        len: length * unroll_factor,
                         var: variable,
                         alignment: None,
                     };
@@ -406,7 +417,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                 Variable::LocalArray(id, item, length)
             }
             ir::VariableKind::Matrix { id, mat } => {
-                let elem = self.compile_item(ir::Item::new(mat.elem)).elem();
+                let elem = self.compile_type(ir::Type::new(mat.storage)).elem();
                 if self.state.matrices.contains_key(&id) {
                     Variable::CoopMatrix(id, elem)
                 } else {
@@ -417,7 +428,8 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             }
             ir::VariableKind::Pipeline { .. } => panic!("Pipeline not supported."),
             ir::VariableKind::Barrier { .. } => panic!("Barrier not supported."),
-            ir::VariableKind::TensorMap(_) => panic!("Tensor map not supported."),
+            ir::VariableKind::TensorMapInput(_) => panic!("Tensor map not supported."),
+            ir::VariableKind::TensorMapOutput(_) => panic!("Tensor map not supported."),
         }
     }
 
@@ -529,7 +541,11 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             Variable::SharedMemory(id, item, _) => {
                 let ptr_ty =
                     Item::Pointer(StorageClass::Workgroup, Box::new(item.clone())).id(self);
-                let id = access_chain(self, ptr_ty, None, *id, vec![index_id]).unwrap();
+                let mut index = vec![index_id];
+                if self.compilation_options.supports_explicit_smem {
+                    index.insert(0, self.const_u32(0));
+                }
+                let id = access_chain(self, ptr_ty, None, *id, index).unwrap();
                 IndexedVariable::Pointer(id, item.clone())
             }
             Variable::ConstantArray(id, item, _) | Variable::LocalArray(id, item, _) => {

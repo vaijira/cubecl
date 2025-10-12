@@ -1,6 +1,3 @@
-#![allow(unknown_lints)] // `manual_div_ceil` only appeared in 1.83
-#![allow(clippy::manual_div_ceil)]
-
 use cubecl::prelude::barrier::{Barrier, BarrierLevel};
 use cubecl::prelude::*;
 use std::marker::PhantomData;
@@ -727,6 +724,7 @@ fn launch_ref<R: Runtime, E: Float>(
 
 impl<R: Runtime, E: Float> Benchmark for MemcpyAsyncBench<R, E> {
     type Input = (TensorHandle<R, E>, TensorHandle<R, E>);
+    type Output = ();
 
     fn prepare(&self) -> Self::Input {
         let client = R::client(&self.device);
@@ -757,7 +755,7 @@ impl<R: Runtime, E: Float> Benchmark for MemcpyAsyncBench<R, E> {
         format!(
             "memcpy_async-{}-{}-{:?}",
             R::name(&client),
-            E::as_elem_native_unchecked(),
+            E::as_type_native_unchecked(),
             self.strategy
         )
         .to_lowercase()
@@ -768,7 +766,8 @@ impl<R: Runtime, E: Float> Benchmark for MemcpyAsyncBench<R, E> {
     }
 
     fn profile(&self, args: Self::Input) -> cubecl::benchmark::ProfileDuration {
-        self.client.profile(|| self.execute(args))
+        self.client
+            .profile(|| self.execute(args), "memcpy-async-bench")
     }
 }
 

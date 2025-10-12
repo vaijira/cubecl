@@ -1,6 +1,6 @@
 use crate::components::{
-    InputIdent,
-    global::{MaxLoaderPlanes, specialization::roles::PlaneRoles},
+    MatmulIdent,
+    global::{MaxGlobalReaderPlanes, specialization::roles::PlaneRoles},
 };
 
 /// Configuration for how each input tensor (Lhs and Rhs) is loaded,
@@ -48,18 +48,22 @@ impl SpecializationTensorConfig {
 impl LoadSpecializationConfig {
     /// Computes how many planes of each role there should be,
     /// using the number of planes needed for main execution, and how
-    /// many planes each loader can handle
+    /// many planes each reader can handle
     ///
-    /// The strategy is to find a balanced divisor for loader planes that stays as
+    /// The strategy is to find a balanced divisor for reader planes that stays as
     /// close as possible to the main execution plane count.
-    pub fn to_plane_roles(&self, main_flow: u32, loader_tasks: MaxLoaderPlanes) -> PlaneRoles {
+    pub fn to_plane_roles(
+        &self,
+        main_flow: u32,
+        reader_tasks: MaxGlobalReaderPlanes,
+    ) -> PlaneRoles {
         use SpecializationTensorConfig::*;
 
         let ideal_load_only = match (self.lhs, self.rhs) {
             (MainFlowOnly, MainFlowOnly) => 0,
-            (MainFlowOnly, LoadFlowOnly) => loader_tasks.rhs,
-            (LoadFlowOnly, MainFlowOnly) => loader_tasks.lhs,
-            (LoadFlowOnly, LoadFlowOnly) => gcd(loader_tasks.lhs, loader_tasks.rhs),
+            (MainFlowOnly, LoadFlowOnly) => reader_tasks.rhs,
+            (LoadFlowOnly, MainFlowOnly) => reader_tasks.lhs,
+            (LoadFlowOnly, LoadFlowOnly) => gcd(reader_tasks.lhs, reader_tasks.rhs),
         };
 
         // Don't stray too far from main_flow
@@ -78,7 +82,7 @@ fn best_divisor_close_to_reference(dividible_value: u32, reference: u32) -> u32 
     let mut best_dist = reference.abs_diff(1);
 
     for d in 1..=dividible_value {
-        if dividible_value % d == 0 {
+        if dividible_value.is_multiple_of(d) {
             let dist = reference.abs_diff(d);
             if dist < best_dist || (dist == best_dist && d > best) {
                 best = d;
@@ -106,21 +110,21 @@ pub enum LoadingSides {
 impl LoadingSides {
     /// Returns `true` if Lhs is included.
     pub fn includes_lhs(&self) -> bool {
-        self.includes(InputIdent::Lhs)
+        self.includes(MatmulIdent::Lhs)
     }
 
     /// Returns `true` if Rhs is included.
     pub fn includes_rhs(&self) -> bool {
-        self.includes(InputIdent::Rhs)
+        self.includes(MatmulIdent::Rhs)
     }
 
     /// Returns `true` if the given input is included.
-    pub fn includes(&self, ident: InputIdent) -> bool {
+    pub fn includes(&self, ident: MatmulIdent) -> bool {
         matches!(
             (self, ident),
             (LoadingSides::Both, _)
-                | (LoadingSides::Lhs, InputIdent::Lhs)
-                | (LoadingSides::Rhs, InputIdent::Rhs)
+                | (LoadingSides::Lhs, MatmulIdent::Lhs)
+                | (LoadingSides::Rhs, MatmulIdent::Rhs)
         )
     }
 }
@@ -137,7 +141,7 @@ impl SpecializedLoadingSides {
     pub fn num_loading_planes(
         &self,
         specialized: bool,
-        ident: InputIdent,
+        ident: MatmulIdent,
         plane_roles: PlaneRoles,
     ) -> u32 {
         if specialized {

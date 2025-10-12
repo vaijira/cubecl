@@ -14,7 +14,7 @@ pub(crate) fn assert_equals_approx<
     expected: &[F],
     epsilon: F,
 ) {
-    let actual = client.read_one(output.binding());
+    let actual = client.read_one(output);
     let actual = F::from_bytes(&actual);
 
     for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
@@ -77,6 +77,52 @@ macro_rules! test_unary_impl {
     };
 }
 
+macro_rules! test_unary_impl_fixed {
+    (
+        $test_name:ident,
+        $float_type:ident,
+        $out_type:ident,
+        $unary_func:expr,
+        [$({
+            input_vectorization: $input_vectorization:expr,
+            out_vectorization: $out_vectorization:expr,
+            input: $input:expr,
+            expected: $expected:expr
+        }),*]) => {
+        pub fn $test_name<R: Runtime, $float_type: Float + num_traits::Float + CubeElement + Display>(client: ComputeClient<R::Server, R::Channel>) {
+            #[cube(launch_unchecked)]
+            fn test_function<$float_type: Float>(input: &Array<$float_type>, output: &mut Array<$out_type>) {
+                if ABSOLUTE_POS < input.len() {
+                    output[ABSOLUTE_POS] = $unary_func(input[ABSOLUTE_POS]) as $out_type;
+                }
+            }
+
+            $(
+            {
+                let input = $input;
+                let output_handle = client.empty(input.len() * core::mem::size_of::<$out_type>());
+                let input_handle = client.create($float_type::as_bytes(input));
+
+                unsafe {
+                    test_function::launch_unchecked::<$float_type, R>(
+                        &client,
+                        CubeCount::Static(1, 1, 1),
+                        CubeDim::new((input.len() / $input_vectorization as usize) as u32, 1, 1),
+                        ArrayArg::from_raw_parts::<$float_type>(&input_handle, input.len(), $input_vectorization),
+                        ArrayArg::from_raw_parts::<$out_type>(&output_handle, $expected.len(), $out_vectorization),
+                    )
+                };
+
+                let actual = client.read_one(output_handle);
+                let actual = $out_type::from_bytes(&actual);
+
+                assert_eq!(actual, $expected);
+            }
+            )*
+        }
+    };
+}
+
 macro_rules! test_unary_impl_int {
     (
         $test_name:ident,
@@ -112,7 +158,7 @@ macro_rules! test_unary_impl_int {
                     )
                 };
 
-                let actual = client.read_one(output_handle.binding());
+                let actual = client.read_one(output_handle);
                 let actual = $int_type::from_bytes(&actual);
 
                 assert_eq!(actual, $expected);
@@ -158,7 +204,7 @@ macro_rules! test_unary_impl_int_fixed {
                     )
                 };
 
-                let actual = client.read_one(output_handle.binding());
+                let actual = client.read_one(output_handle);
                 let actual = $out_type::from_bytes(&actual);
 
                 assert_eq!(actual, $expected);
@@ -200,6 +246,27 @@ test_unary_impl!(
     ]
 );
 
+test_unary_impl!(test_abs, F, F::abs, [
+    {
+        input_vectorization: 1,
+        out_vectorization: 1,
+        input: as_type![F: -1., 0., 2., -3.],
+        expected: as_type![F: 1., 0., 2., 3.]
+    },
+    {
+        input_vectorization: 2,
+        out_vectorization: 2,
+        input: as_type![F: -1., 0., 2., -3.],
+        expected: as_type![F: 1., 0., 2., 3.]
+    },
+    {
+        input_vectorization: 4,
+        out_vectorization: 4,
+        input: as_type![F: -1., 0., 2., -3.],
+        expected: as_type![F: 1., 0., 2., 3.]
+    }
+]);
+
 test_unary_impl!(
     test_normalize,
     F,
@@ -234,6 +301,60 @@ test_unary_impl!(
             out_vectorization: 2,
             input: as_type![F: 0., 0., 1., 0.],
             expected: as_type![F: f32::NAN, f32::NAN, 1., 0.]
+        }
+    ]
+);
+
+test_unary_impl_fixed!(
+    test_is_nan,
+    F,
+    u32,
+    F::is_nan,
+    [
+        {
+            input_vectorization: 1,
+            out_vectorization: 1,
+            input: &[F::new(0.), F::NAN, F::INFINITY, F::NEG_INFINITY],
+            expected: as_type![u32: false as i64, true as i64, false as i64, false as i64]
+        },
+        {
+            input_vectorization: 2,
+            out_vectorization: 2,
+            input: &[F::INFINITY, F::new(-100.), F::NAN, F::NEG_INFINITY],
+            expected: as_type![u32: false as i64, false as i64, true as i64, false as i64]
+        },
+        {
+            input_vectorization: 4,
+            out_vectorization: 4,
+            input: &[F::NEG_INFINITY, F::INFINITY, F::new(100.), F::NAN],
+            expected: as_type![u32: false as i64, false as i64, false as i64, true as i64]
+        }
+    ]
+);
+
+test_unary_impl_fixed!(
+    test_is_inf,
+    F,
+    u32,
+    F::is_inf,
+    [
+        {
+            input_vectorization: 1,
+            out_vectorization: 1,
+            input: as_type![F: 0., f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            expected: as_type![u32: false as i64, false as i64, true as i64, true as i64]
+        },
+        {
+            input_vectorization: 2,
+            out_vectorization: 2,
+            input: as_type![F: f32::INFINITY, -100., f32::NAN, f32::NEG_INFINITY],
+            expected: as_type![u32: true as i64, false as i64, false as i64, true as i64]
+        },
+        {
+            input_vectorization: 4,
+            out_vectorization: 4,
+            input: as_type![F: f32::NEG_INFINITY, f32::INFINITY, 100., f32::NAN],
+            expected: as_type![u32: true as i64, true as i64, false as i64, false as i64]
         }
     ]
 );
@@ -357,9 +478,33 @@ macro_rules! testgen_unary {
 
             add_test!(test_normalize);
             add_test!(test_magnitude);
+            add_test!(test_abs);
+            add_test!(test_is_nan);
+            add_test!(test_is_inf);
         }
     };
 }
+
+test_unary_impl_int!(test_abs_int, I, I::abs, [
+    {
+        input_vectorization: 1,
+        out_vectorization: 1,
+        input: as_type![I: 3, -5, 0, -127],
+        expected: as_type![I: 3, 5, 0, 127]
+    },
+    {
+        input_vectorization: 2,
+        out_vectorization: 2,
+        input: as_type![I: 3, -5, 0, -127],
+        expected: as_type![I: 3, 5, 0, 127]
+    },
+    {
+        input_vectorization: 4,
+        out_vectorization: 4,
+        input: as_type![I: 3, -5, 0, -127],
+        expected: as_type![I: 3, 5, 0, 127]
+    }
+]);
 
 #[allow(missing_docs)]
 #[macro_export]
@@ -380,6 +525,7 @@ macro_rules! testgen_unary_int {
                 };
             }
 
+            add_test!(test_abs_int);
             add_test!(test_count_ones);
             add_test!(test_reverse_bits);
             add_test!(test_leading_zeros);

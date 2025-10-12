@@ -1,10 +1,10 @@
-use cubecl_core::{Feature, WgpuCompilationOptions, ir::UIntKind};
+use cubecl_core::{WgpuCompilationOptions, ir::UIntKind};
 use cubecl_cpp::{
     DialectWmmaCompiler,
     metal::{MslDialect, arch::MetalArchitecture},
     shared::register_wmma_features,
 };
-use cubecl_runtime::DeviceProperties;
+use cubecl_runtime::{DeviceProperties, EnumSet, Plane, TypeUsage};
 use wgpu::{
     DeviceDescriptor, Features, Limits,
     hal::{self, Adapter, metal},
@@ -16,9 +16,8 @@ pub async fn request_metal_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgp
         .features()
         .difference(Features::MAPPABLE_PRIMARY_BUFFERS);
     unsafe {
-        adapter.as_hal::<hal::api::Metal, _, _>(|hal_adapter| {
-            request_device(adapter, hal_adapter.unwrap(), features, limits)
-        })
+        let hal_adapter = adapter.as_hal::<hal::api::Metal>().unwrap();
+        request_device(adapter, &hal_adapter, features, limits)
     }
 }
 
@@ -55,61 +54,70 @@ fn request_device(
 
 pub fn register_metal_features(
     adapter: &wgpu::Adapter,
-    props: &mut cubecl_runtime::DeviceProperties<cubecl_core::Feature>,
+    props: &mut cubecl_runtime::DeviceProperties,
     comp_options: &mut WgpuCompilationOptions,
 ) {
     let features = adapter.features();
     unsafe {
-        adapter.as_hal::<hal::api::Metal, _, _>(|hal_adapter| {
-            if let Some(adapter) = hal_adapter {
-                register_features(adapter, props, features, comp_options);
-            }
-        })
+        if let Some(adapter) = adapter.as_hal::<hal::api::Metal>() {
+            register_features(&adapter, props, features, comp_options);
+        }
     }
 }
 
 fn register_features(
     _adapter: &metal::Adapter,
-    props: &mut cubecl_runtime::DeviceProperties<cubecl_core::Feature>,
+    props: &mut cubecl_runtime::DeviceProperties,
     _features: Features,
     _comp_options: &mut WgpuCompilationOptions,
 ) {
     register_types(props);
     register_cmma(props);
-    props.register_feature(Feature::SyncPlane);
+    props.features.plane.insert(Plane::Ops);
+    props.features.plane.insert(Plane::Sync);
 }
 
-fn register_types(props: &mut DeviceProperties<Feature>) {
-    use cubecl_core::ir::{Elem, FloatKind, IntKind};
+fn register_types(props: &mut DeviceProperties) {
+    use cubecl_core::ir::{ElemType, FloatKind, IntKind, StorageType};
 
-    let mut register = |elem| {
-        props.register_feature(Feature::Type(elem));
+    let mut register = |elem: StorageType, usage: EnumSet<TypeUsage>| {
+        props.register_type_usage(elem, usage);
     };
 
     let types = [
-        Elem::UInt(UIntKind::U8),
-        Elem::UInt(UIntKind::U16),
-        Elem::UInt(UIntKind::U32),
-        Elem::UInt(UIntKind::U64),
-        Elem::Int(IntKind::I8),
-        Elem::Int(IntKind::I16),
-        Elem::Int(IntKind::I32),
-        Elem::Int(IntKind::I64),
-        Elem::Float(FloatKind::F16),
-        Elem::Float(FloatKind::F32),
-        Elem::AtomicInt(IntKind::I32),
-        Elem::AtomicUInt(UIntKind::U32),
-        Elem::AtomicUInt(UIntKind::U64),
-        Elem::AtomicFloat(FloatKind::F32),
-        Elem::Bool,
+        ElemType::UInt(UIntKind::U8),
+        ElemType::UInt(UIntKind::U16),
+        ElemType::UInt(UIntKind::U32),
+        ElemType::UInt(UIntKind::U64),
+        ElemType::Int(IntKind::I8),
+        ElemType::Int(IntKind::I16),
+        ElemType::Int(IntKind::I32),
+        ElemType::Int(IntKind::I64),
+        ElemType::Float(FloatKind::F16),
+        ElemType::Float(FloatKind::F32),
+        ElemType::Bool,
+    ];
+
+    let atomic_types = [
+        ElemType::Int(IntKind::I32),
+        ElemType::UInt(UIntKind::U32),
+        ElemType::UInt(UIntKind::U64),
+        ElemType::Float(FloatKind::F32),
     ];
 
     for ty in types {
-        register(ty);
+        register(ty.into(), TypeUsage::all_scalar());
+    }
+
+    for ty in atomic_types {
+        register(
+            StorageType::Atomic(ty),
+            TypeUsage::AtomicAdd | TypeUsage::AtomicLoadStore,
+        )
     }
 }
 
-fn register_cmma(props: &mut DeviceProperties<Feature>) {
+fn register_cmma(props: &mut DeviceProperties) {
     let combinations = MslDialect::supported_wmma_combinations(&MetalArchitecture::Metal3);
     register_wmma_features(combinations, props);
 }

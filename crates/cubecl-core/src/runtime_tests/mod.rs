@@ -5,6 +5,7 @@ pub mod binary;
 pub mod branch;
 pub mod cluster;
 pub mod cmma;
+pub mod comparison;
 pub mod const_match;
 pub mod constants;
 pub mod debug;
@@ -16,14 +17,18 @@ pub mod line;
 pub mod metadata;
 pub mod minifloat;
 pub mod plane;
+pub mod saturating;
 pub mod sequence;
 pub mod slice;
-pub mod sync_plane;
+pub mod stream;
+pub mod synchronization;
 pub mod tensor;
 pub mod tensormap;
+pub mod to_client;
 pub mod topology;
 pub mod traits;
 pub mod unary;
+pub mod unroll;
 
 #[allow(missing_docs)]
 #[macro_export]
@@ -37,6 +42,7 @@ macro_rules! testgen_all {
 
         $crate::testgen_float!();
         $crate::testgen_int!();
+        $crate::testgen_uint!();
         $crate::testgen_untyped!();
     };
     ($f_def:ident: [$($float:ident),*], $i_def:ident: [$($int:ident),*], $u_def:ident: [$($uint:ident),*]) => {
@@ -83,7 +89,6 @@ macro_rules! testgen_float {
         cubecl_core::testgen_barrier!();
         cubecl_core::testgen_binary!();
         cubecl_core::testgen_branch!();
-        cubecl_core::testgen_const_match!();
         cubecl_core::testgen_different_rank!();
         cubecl_core::testgen_index!();
         cubecl_core::testgen_launch!();
@@ -91,10 +96,12 @@ macro_rules! testgen_float {
         cubecl_core::testgen_plane!();
         cubecl_core::testgen_sequence!();
         cubecl_core::testgen_slice!();
+        cubecl_core::testgen_stream!();
         cubecl_core::testgen_unary!();
         cubecl_core::testgen_atomic_float!();
         cubecl_core::testgen_tensormap!();
         cubecl_core::testgen_minifloat!();
+        cubecl_core::testgen_unroll!();
     };
 }
 
@@ -104,6 +111,7 @@ macro_rules! testgen_int {
     () => {
         cubecl_core::testgen_unary_int!();
         cubecl_core::testgen_atomic_int!();
+        cubecl_core::testgen_saturating_int!();
     };
 }
 
@@ -112,6 +120,7 @@ macro_rules! testgen_int {
 macro_rules! testgen_uint {
     () => {
         cubecl_core::testgen_const_match!();
+        cubecl_core::testgen_saturating_uint!();
     };
 }
 
@@ -131,6 +140,9 @@ macro_rules! testgen_untyped {
         cubecl_core::testgen_cluster!();
 
         cubecl_core::testgen_enums!();
+        cubecl_core::testgen_comparison!();
+
+        cubecl_core::testgen_to_client!();
     };
 }
 

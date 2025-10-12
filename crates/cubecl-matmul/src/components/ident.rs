@@ -1,43 +1,44 @@
+use crate::components::global::memory::ViewDirection;
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 /// Identifier for all three tensors in a matmul
 ///
 /// Useful to specialize some functions depending on the tensor
-pub enum Ident {
+pub enum MatmulIdent {
     Lhs,
     Rhs,
     Out,
 }
 
-impl Ident {
-    pub fn as_input_ident(&self) -> InputIdent {
+impl MatmulIdent {
+    /// Equivalent to into, but type inference works better within Cube functions
+    pub fn into_stage(self) -> StageIdent {
+        self.into()
+    }
+
+    pub fn view_direction(&self) -> ViewDirection {
         match self {
-            Ident::Lhs => InputIdent::Lhs,
-            Ident::Rhs => InputIdent::Rhs,
-            Ident::Out => panic!("Out is not an input."),
+            MatmulIdent::Lhs => ViewDirection::Col,
+            MatmulIdent::Rhs => ViewDirection::Row,
+            MatmulIdent::Out => ViewDirection::None,
         }
     }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-/// Identifier for the two input tensors in a matmul.
-///
-/// Useful to specialize some functions depending on the tensor
-pub enum InputIdent {
+pub enum StageIdent {
     Lhs,
     Rhs,
+    Acc,
+    Out,
 }
 
-impl InputIdent {
-    pub fn as_ident(&self) -> Ident {
-        match self {
-            InputIdent::Lhs => Ident::Lhs,
-            InputIdent::Rhs => Ident::Rhs,
+impl From<MatmulIdent> for StageIdent {
+    fn from(matmul_ident: MatmulIdent) -> Self {
+        match matmul_ident {
+            MatmulIdent::Lhs => StageIdent::Lhs,
+            MatmulIdent::Rhs => StageIdent::Rhs,
+            MatmulIdent::Out => StageIdent::Acc,
         }
-    }
-}
-
-impl From<InputIdent> for Ident {
-    fn from(value: InputIdent) -> Self {
-        value.as_ident()
     }
 }

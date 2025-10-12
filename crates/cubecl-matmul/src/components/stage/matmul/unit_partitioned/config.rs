@@ -1,8 +1,8 @@
 use crate::components::{
-    Ident, InputIdent, MatrixLayout, TilingScheme,
+    MatrixLayout, StageIdent, TilingScheme,
     error::MatmulSetupError,
     global::{PlaneRoleConfig, RoleRuleConfig},
-    stage::{NumStages, PartitionBuffering, StageConfig},
+    stage::{NumStages, PartitionBuffering, PartitionSchedulerScheme, StageConfig},
     tile::TileConfig,
 };
 
@@ -25,15 +25,15 @@ impl<T: TileConfig> StageConfig for UnitPartitionedStageConfig<T> {
         self.tile_config
     }
 
-    fn stage_line_size<I: Into<Ident>>(&self, ident: I) -> u32 {
+    fn stage_line_size(&self, ident: StageIdent) -> u32 {
         self.tile_config.stage_line_size(ident)
     }
 
-    fn global_line_size<I: Into<Ident>>(&self, ident: I) -> u32 {
+    fn global_line_size(&self, ident: StageIdent) -> u32 {
         self.tile_config.global_line_size(ident)
     }
 
-    fn matrix_layout<I: Into<Ident>>(&self, ident: I) -> MatrixLayout {
+    fn matrix_layout(&self, ident: StageIdent) -> MatrixLayout {
         self.tile_config.matrix_layout(ident)
     }
 
@@ -43,13 +43,6 @@ impl<T: TileConfig> StageConfig for UnitPartitionedStageConfig<T> {
 
     fn partition_buffering(&self) -> PartitionBuffering {
         self.partition_buffering
-    }
-
-    fn num_stages(&self, ident: InputIdent) -> u32 {
-        match ident {
-            InputIdent::Lhs => self.num_stages.lhs,
-            InputIdent::Rhs => self.num_stages.rhs,
-        }
     }
 
     fn tiling_scheme(&self) -> TilingScheme {
@@ -85,6 +78,19 @@ impl<T: TileConfig> StageConfig for UnitPartitionedStageConfig<T> {
         };
         !execution_is_sync && self.ordered
     }
+
+    fn partition_schedule_scheme(&self) -> PartitionSchedulerScheme {
+        PartitionSchedulerScheme::Naive
+    }
+
+    fn num_stages(&self, ident: StageIdent) -> u32 {
+        match ident {
+            StageIdent::Lhs => self.num_stages.lhs,
+            StageIdent::Rhs => self.num_stages.rhs,
+            StageIdent::Acc => 1,
+            StageIdent::Out => 1,
+        }
+    }
 }
 
 impl<T: TileConfig> UnitPartitionedStageConfig<T> {
@@ -102,7 +108,8 @@ impl<T: TileConfig> UnitPartitionedStageConfig<T> {
         partition_buffering: PartitionBuffering,
         num_stages: NumStages,
         plane_role_config: PlaneRoleConfig,
-        es_size: u32,
+        lhs_s_size: u32,
+        rhs_s_size: u32,
         eo_size: u32,
         smem_limit: u32,
         ordered: bool,
@@ -116,17 +123,21 @@ impl<T: TileConfig> UnitPartitionedStageConfig<T> {
             plane_role_config,
             ordered,
         }
-        .validate(es_size, eo_size, smem_limit)
+        .validate(lhs_s_size, rhs_s_size, eo_size, smem_limit)
     }
 
     fn validate(
         self,
-        es_size: u32,
+        lhs_s_size: u32,
+        rhs_s_size: u32,
         eo_size: u32,
         smem_limit: u32,
     ) -> Result<Self, MatmulSetupError> {
-        let num_units_needed = self.tiling_scheme().stage_partitions_in_stage_mn();
-        let num_units = self.plane_dim() * self.num_main_flow_planes();
+        let tiling_scheme = <Self as StageConfig>::tiling_scheme(&self);
+        let num_main_flow_planes = <Self as StageConfig>::num_main_flow_planes(&self);
+
+        let num_units_needed = tiling_scheme.stage_partitions_in_stage_mn();
+        let num_units = self.plane_dim() * num_main_flow_planes;
 
         if num_units != num_units_needed {
             return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
@@ -135,7 +146,7 @@ impl<T: TileConfig> UnitPartitionedStageConfig<T> {
         }
 
         if self.partition_buffering() == PartitionBuffering::Double
-            && self.tiling_scheme().tiles_in_stage_partition_n() < 2
+            && tiling_scheme.tiles_in_stage_partition_n() < 2
         {
             return Err(MatmulSetupError::InvalidConfig(Box::new(
                 "Error: Tried doing partition double buffering with only one tile to compute.",
@@ -144,9 +155,9 @@ impl<T: TileConfig> UnitPartitionedStageConfig<T> {
 
         let lhs_smem_size = self.tiling_scheme.elements_in_stage_mk() * self.num_stages.lhs;
         let rhs_smem_size = self.tiling_scheme.elements_in_stage_nk() * self.num_stages.rhs;
-        let num_primitives = self.num_main_flow_planes() * self.plane_dim();
-        let out_smem_size = self.tiling_scheme.elements_in_tile_mn() * num_primitives;
-        let smem_total_size = es_size * (lhs_smem_size + rhs_smem_size) + eo_size * out_smem_size;
+        let out_smem_size = self.tiling_scheme.elements_in_tile_mn() * num_units;
+        let smem_total_size =
+            lhs_s_size * lhs_smem_size + rhs_s_size * rhs_smem_size + eo_size * out_smem_size;
 
         if smem_total_size > smem_limit {
             return Err(MatmulSetupError::InvalidConfig(Box::new(format!(

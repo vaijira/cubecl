@@ -1,5 +1,6 @@
 use cubecl_common::CubeDim;
-use cubecl_ir::{Elem, Id, Item, Scope};
+use cubecl_ir::{Id, Scope, StorageType, Type};
+use enumset::EnumSet;
 
 use crate::{
     compute::{Binding, KernelDefinition, Location, ScalarBinding, Visibility},
@@ -13,7 +14,7 @@ pub struct KernelIntegrator {
     expansion: KernelExpansion,
     buffer_bindings: Vec<Binding>,
     scalar_bindings: Vec<ScalarBinding>,
-    tensor_maps: Vec<Id>,
+    tensor_maps: Vec<Binding>,
 }
 
 /// The information necessary to compile a [kernel definition](KernelDefinition).
@@ -21,7 +22,7 @@ pub struct KernelIntegrator {
 pub struct KernelExpansion {
     pub buffers: Vec<BufferInfo>,
     pub scalars: Vec<ScalarInfo>,
-    pub tensor_maps: Vec<Id>,
+    pub tensor_maps: Vec<BufferInfo>,
     pub scope: Scope,
 }
 
@@ -35,7 +36,7 @@ pub struct KernelSettings {
 pub struct KernelOptions {
     pub kernel_name: String,
     pub debug_symbols: bool,
-    pub fp_math_mode: FastMath,
+    pub fp_math_mode: EnumSet<FastMath>,
     pub cluster_dim: Option<CubeDim>,
 }
 
@@ -61,7 +62,7 @@ impl KernelSettings {
     }
 
     /// Set FP math mode
-    pub fn fp_math_mode(mut self, mode: FastMath) -> Self {
+    pub fn fp_math_mode(mut self, mode: EnumSet<FastMath>) -> Self {
         self.options.fp_math_mode = mode;
         self
     }
@@ -77,7 +78,7 @@ impl KernelSettings {
 #[derive(Clone, Debug)]
 pub struct BufferInfo {
     pub id: Id,
-    pub item: Item,
+    pub item: Type,
     pub visibility: Visibility,
     /// Whether this input has extended metadata (rank, shape, strides)
     pub has_extended_meta: bool,
@@ -86,7 +87,7 @@ pub struct BufferInfo {
 /// Information related to a scalar input.
 #[derive(Clone, Debug)]
 pub struct ScalarInfo {
-    pub elem: Elem,
+    pub ty: StorageType,
     pub count: usize,
 }
 
@@ -107,7 +108,7 @@ impl KernelIntegrator {
         self.register_scalars();
         self.register_tensor_maps();
 
-        self.scalar_bindings.sort_by_key(|binding| binding.elem);
+        self.scalar_bindings.sort_by_key(|binding| binding.ty);
 
         KernelDefinition {
             buffers: self.buffer_bindings,
@@ -123,7 +124,7 @@ impl KernelIntegrator {
         for buffer in self.expansion.buffers.drain(..) {
             self.buffer_bindings.push(Binding {
                 id: buffer.id,
-                item: buffer.item,
+                ty: buffer.item,
                 visibility: buffer.visibility,
                 location: Location::Storage,
                 has_extended_meta: buffer.has_extended_meta,
@@ -135,15 +136,22 @@ impl KernelIntegrator {
     fn register_scalars(&mut self) {
         for scalar in self.expansion.scalars.drain(..) {
             self.scalar_bindings.push(ScalarBinding {
-                elem: scalar.elem,
+                ty: scalar.ty,
                 count: scalar.count,
             });
         }
     }
 
     fn register_tensor_maps(&mut self) {
-        for id in self.expansion.tensor_maps.drain(..) {
-            self.tensor_maps.push(id);
+        for buffer in self.expansion.tensor_maps.drain(..) {
+            self.tensor_maps.push(Binding {
+                id: buffer.id,
+                ty: buffer.item,
+                visibility: buffer.visibility,
+                location: Location::Storage,
+                has_extended_meta: buffer.has_extended_meta,
+                size: None,
+            });
         }
     }
 }

@@ -1,17 +1,17 @@
-use ash::{
-    khr::cooperative_matrix,
-    vk::{ComponentTypeKHR, DeviceCreateInfo, DeviceQueueCreateInfo, ScopeKHR, TRUE},
-};
 use cubecl_core::{
-    AtomicFeature, ExecutionMode, Feature, WgpuCompilationOptions,
+    ExecutionMode, WgpuCompilationOptions,
     compute::Visibility,
-    ir::{Elem, FloatKind, IntKind, UIntKind},
+    ir::{ElemType, FloatKind, IntKind, UIntKind},
     prelude::CompiledKernel,
     server::ComputeServer,
 };
-use cubecl_runtime::DeviceProperties;
+use cubecl_runtime::{DeviceProperties, EnumSet, MmaConfig, Plane, TypeUsage};
 use cubecl_spirv::{GLCompute, SpirvCompiler, SpirvKernel};
 use features::ExtendedFeatures;
+use tracel_ash::{
+    khr::cooperative_matrix,
+    vk::{ComponentTypeKHR, DeviceCreateInfo, DeviceQueueCreateInfo, ScopeKHR, TRUE},
+};
 use wgpu::{
     DeviceDescriptor, Features, Limits,
     hal::{
@@ -26,13 +26,14 @@ mod features;
 
 pub type VkSpirvCompiler = SpirvCompiler<GLCompute>;
 
-pub fn bindings(repr: &SpirvKernel) -> Vec<(usize, Visibility)> {
-    let mut bindings: Vec<_> = repr.bindings.iter().map(|it| it.visibility).collect();
+pub fn bindings(repr: &SpirvKernel) -> (Vec<Visibility>, Vec<Visibility>) {
+    let bindings: Vec<_> = repr.bindings.iter().map(|it| it.visibility).collect();
+    let mut meta = vec![];
     if repr.has_metadata {
-        bindings.push(Visibility::Read);
+        meta.push(Visibility::Read);
     }
-    bindings.extend(repr.scalars.iter().map(|_| Visibility::Read));
-    bindings.into_iter().enumerate().collect()
+    meta.extend(repr.scalars.iter().map(|_| Visibility::Read));
+    (bindings, meta)
 }
 
 pub async fn request_vulkan_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
@@ -41,24 +42,21 @@ pub async fn request_vulkan_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wg
         .features()
         .difference(Features::MAPPABLE_PRIMARY_BUFFERS);
     unsafe {
-        adapter.as_hal::<hal::api::Vulkan, _, _>(|hal_adapter| {
-            request_device(adapter, hal_adapter.unwrap(), features, limits)
-        })
+        let hal_adapter = adapter.as_hal::<hal::api::Vulkan>().unwrap();
+        request_device(adapter, &hal_adapter, features, limits)
     }
 }
 
 pub fn register_vulkan_features(
     adapter: &wgpu::Adapter,
-    props: &mut cubecl_runtime::DeviceProperties<cubecl_core::Feature>,
+    props: &mut cubecl_runtime::DeviceProperties,
     comp_options: &mut WgpuCompilationOptions,
 ) {
     let features = adapter.features();
     unsafe {
-        adapter.as_hal::<hal::api::Vulkan, _, _>(|hal_adapter| {
-            if let Some(adapter) = hal_adapter {
-                register_features(adapter, props, features, comp_options);
-            }
-        })
+        if let Some(adapter) = adapter.as_hal::<hal::api::Vulkan>() {
+            register_features(&adapter, props, features, comp_options);
+        }
     }
 }
 
@@ -103,9 +101,9 @@ fn request_device(
     let pre_info = DeviceCreateInfo::default()
         .queue_create_infos(&family_infos)
         .enabled_extension_names(&str_pointers);
-    let mut info = phys_features.add_to_device_create(pre_info);
+    let mut info = phys_features.add_to_device_create(pre_info.into());
     info = info.enabled_features(&supported_feat);
-    info = extended_feat.add_to_device_create(info);
+    info = extended_feat.add_to_device_create(info.into()).into();
 
     let vk_device = unsafe {
         ash.raw_instance()
@@ -149,7 +147,7 @@ fn request_device(
 /// Request device's supported features
 fn register_features(
     adapter: &vulkan::Adapter,
-    props: &mut cubecl_runtime::DeviceProperties<cubecl_core::Feature>,
+    props: &mut cubecl_runtime::DeviceProperties,
     features: Features,
     comp_options: &mut WgpuCompilationOptions,
 ) {
@@ -160,27 +158,18 @@ fn register_features(
 
     register_types(props, &extended_feat);
     comp_options.supports_u64 = true;
-    props.register_feature(Feature::SyncPlane);
+    props.features.plane.insert(Plane::Sync);
 
-    if let Some(atomic_float) = &extended_feat.atomic_float {
-        if atomic_float.shader_buffer_float32_atomics == TRUE {
-            props.register_feature(Feature::AtomicFloat(AtomicFeature::LoadStore));
-        }
-        if atomic_float.shader_buffer_float32_atomic_add == TRUE {
-            props.register_feature(Feature::AtomicFloat(AtomicFeature::Add));
-        }
+    if let Some(float_controls2) = &extended_feat.float_controls2
+        && float_controls2.shader_float_controls2 == TRUE
+    {
+        comp_options.supports_fp_fast_math = true;
     }
 
-    if let Some(atomic_float2) = &extended_feat.atomic_float2 {
-        if atomic_float2.shader_buffer_float32_atomic_min_max == TRUE {
-            props.register_feature(Feature::AtomicFloat(AtomicFeature::MinMax));
-        }
-    }
-
-    if let Some(float_controls2) = &extended_feat.float_controls2 {
-        if float_controls2.shader_float_controls2 == TRUE {
-            comp_options.supports_fp_fast_math = true;
-        }
+    if let Some(wg_explicit_layout) = &extended_feat.wg_explicit_layout
+        && wg_explicit_layout.workgroup_memory_explicit_layout == TRUE
+    {
+        comp_options.supports_explicit_smem = true;
     }
 
     if extended_feat.cmma.is_some() {
@@ -188,63 +177,155 @@ fn register_features(
     }
 }
 
-fn register_types(props: &mut DeviceProperties<Feature>, ext_feat: &ExtendedFeatures<'_>) {
-    use cubecl_core::ir::{Elem, FloatKind, IntKind};
+fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>) {
+    use cubecl_core::ir::{ElemType, FloatKind, IntKind, StorageType};
 
-    let mut register = |elem| {
-        props.register_feature(Feature::Type(elem));
+    let mut register = |elem: StorageType, usage: EnumSet<TypeUsage>| {
+        props.register_type_usage(elem, usage);
     };
 
     let default_types = [
-        Elem::UInt(UIntKind::U16),
-        Elem::UInt(UIntKind::U32),
-        Elem::UInt(UIntKind::U64),
-        Elem::Int(IntKind::I16),
-        Elem::Int(IntKind::I32),
-        Elem::Int(IntKind::I64),
-        Elem::AtomicInt(IntKind::I32),
-        Elem::AtomicInt(IntKind::I64),
-        Elem::AtomicUInt(UIntKind::U32),
-        Elem::AtomicUInt(UIntKind::U64),
-        Elem::Float(FloatKind::F32),
+        ElemType::UInt(UIntKind::U16),
+        ElemType::UInt(UIntKind::U32),
+        ElemType::UInt(UIntKind::U64),
+        ElemType::Int(IntKind::I16),
+        ElemType::Int(IntKind::I32),
+        ElemType::Int(IntKind::I64),
+        ElemType::Float(FloatKind::F32),
         // Elem::Float(FloatKind::F64),
-        Elem::Bool,
+        ElemType::Bool,
+    ];
+
+    let default_atomic_types = [
+        ElemType::Int(IntKind::I32),
+        ElemType::Int(IntKind::I64),
+        ElemType::UInt(UIntKind::U32),
+        ElemType::UInt(UIntKind::U64),
     ];
 
     for ty in default_types {
-        register(ty);
+        register(ty.into(), TypeUsage::all_scalar());
+    }
+
+    for ty in default_atomic_types {
+        register(StorageType::Atomic(ty), TypeUsage::all_atomic())
     }
 
     if ext_feat.float16_int8.shader_float16 == TRUE {
-        register(Elem::Float(FloatKind::F16));
+        register(
+            ElemType::Float(FloatKind::F16).into(),
+            TypeUsage::all_scalar(),
+        );
     }
     if ext_feat.float16_int8.shader_int8 == TRUE {
-        register(Elem::Int(IntKind::I8));
-        register(Elem::UInt(UIntKind::U8));
+        register(ElemType::Int(IntKind::I8).into(), TypeUsage::all_scalar());
+        register(ElemType::UInt(UIntKind::U8).into(), TypeUsage::all_scalar());
+    }
+
+    if let Some(bfloat16) = ext_feat.bfloat16 {
+        if bfloat16.shader_b_float16_type == TRUE {
+            register(
+                ElemType::Float(FloatKind::BF16).into(),
+                TypeUsage::Conversion | TypeUsage::Buffer,
+            );
+        }
+        if bfloat16.shader_b_float16_dot_product == TRUE {
+            register(
+                ElemType::Float(FloatKind::BF16).into(),
+                TypeUsage::DotProduct.into(),
+            );
+        }
+    }
+
+    if let Some(float8) = ext_feat.float8
+        && float8.shader_float8 == TRUE
+    {
+        register(
+            ElemType::Float(FloatKind::E4M3).into(),
+            TypeUsage::Conversion | TypeUsage::Buffer,
+        );
+        register(
+            ElemType::Float(FloatKind::E5M2).into(),
+            TypeUsage::Conversion | TypeUsage::Buffer,
+        );
     }
 
     if let Some(atomic_float) = ext_feat.atomic_float {
         if atomic_float.shader_buffer_float32_atomics == TRUE {
-            register(Elem::AtomicFloat(FloatKind::F32));
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F32)),
+                TypeUsage::AtomicLoadStore.into(),
+            );
+        }
+        if atomic_float.shader_buffer_float32_atomic_add == TRUE {
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F32)),
+                TypeUsage::AtomicAdd.into(),
+            );
+        }
+        if atomic_float.shader_buffer_float64_atomics == TRUE {
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F64)),
+                TypeUsage::AtomicLoadStore.into(),
+            );
+        }
+        if atomic_float.shader_buffer_float64_atomic_add == TRUE {
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F64)),
+                TypeUsage::AtomicAdd.into(),
+            );
         }
     }
 
     if let Some(atomic_float) = ext_feat.atomic_float2 {
         if atomic_float.shader_buffer_float16_atomics == TRUE {
-            register(Elem::AtomicFloat(FloatKind::F16));
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F16)),
+                TypeUsage::AtomicLoadStore.into(),
+            );
+        }
+        if atomic_float.shader_buffer_float16_atomic_add == TRUE {
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F16)),
+                TypeUsage::AtomicAdd.into(),
+            );
+        }
+        if atomic_float.shader_buffer_float16_atomic_min_max == TRUE {
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F16)),
+                TypeUsage::AtomicMinMax.into(),
+            );
+        }
+        if atomic_float.shader_buffer_float32_atomic_min_max == TRUE {
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F32)),
+                TypeUsage::AtomicMinMax.into(),
+            );
+        }
+        if atomic_float.shader_buffer_float64_atomic_min_max == TRUE {
+            register(
+                StorageType::Atomic(ElemType::Float(FloatKind::F64)),
+                TypeUsage::AtomicMinMax.into(),
+            );
         }
     }
 }
 
-fn register_cmma(
-    ash: &InstanceShared,
-    adapter: &vulkan::Adapter,
-    props: &mut DeviceProperties<Feature>,
-) {
+fn register_cmma(ash: &InstanceShared, adapter: &vulkan::Adapter, props: &mut DeviceProperties) {
     let cmma = cooperative_matrix::Instance::new(ash.entry(), ash.raw_instance());
-    let properties = unsafe {
-        cmma.get_physical_device_cooperative_matrix_properties(adapter.raw_physical_device())
-            .unwrap()
+    let num_elems = unsafe {
+        cmma.get_physical_device_cooperative_matrix_properties_len(
+            adapter.raw_physical_device().into(),
+        )
+        .unwrap()
+    };
+    let mut properties = vec![Default::default(); num_elems];
+    unsafe {
+        cmma.get_physical_device_cooperative_matrix_properties(
+            adapter.raw_physical_device().into(),
+            &mut properties,
+        )
+        .unwrap()
     };
     let sizes = properties
         .into_iter()
@@ -260,36 +341,39 @@ fn register_cmma(
             min_current = u32::min(min_current, it.k_size);
             props.hardware.min_tensor_cores_dim = Some(min_current);
 
-            Some(Feature::Cmma {
-                a: convert_type(it.a_type)?,
-                b: convert_type(it.b_type)?,
-                c: convert_type(it.c_type)?,
-                m: it.m_size as u8,
-                k: it.k_size as u8,
-                n: it.n_size as u8,
+            Some(MmaConfig {
+                a_type: convert_type(it.a_type)?.into(),
+                b_type: convert_type(it.b_type)?.into(),
+                cd_type: convert_type(it.c_type)?.into(),
+                m: it.m_size,
+                k: it.k_size,
+                n: it.n_size,
             })
         })
         .collect::<Vec<_>>();
     log::debug!("Supported CMMA sizes: {sizes:#?}");
 
     for size in sizes {
-        props.register_feature(size);
+        props.features.cmma.insert(size);
     }
 }
 
-fn convert_type(vk_ty: ComponentTypeKHR) -> Option<Elem> {
+fn convert_type(vk_ty: ComponentTypeKHR) -> Option<ElemType> {
     let ty = match vk_ty {
-        ComponentTypeKHR::FLOAT16 => Elem::Float(FloatKind::F16),
-        ComponentTypeKHR::FLOAT32 => Elem::Float(FloatKind::F32),
-        ComponentTypeKHR::FLOAT64 => Elem::Float(FloatKind::F64),
-        ComponentTypeKHR::SINT8 => Elem::Int(IntKind::I8),
-        ComponentTypeKHR::SINT16 => Elem::Int(IntKind::I16),
-        ComponentTypeKHR::SINT32 => Elem::Int(IntKind::I32),
-        ComponentTypeKHR::SINT64 => Elem::Int(IntKind::I64),
-        ComponentTypeKHR::UINT8 => Elem::UInt(UIntKind::U8),
-        ComponentTypeKHR::UINT16 => Elem::UInt(UIntKind::U16),
-        ComponentTypeKHR::UINT32 => Elem::UInt(UIntKind::U32),
-        ComponentTypeKHR::UINT64 => Elem::UInt(UIntKind::U64),
+        ComponentTypeKHR::FLOAT8_E4M3_EXT => ElemType::Float(FloatKind::E4M3),
+        ComponentTypeKHR::FLOAT8_E5M2_EXT => ElemType::Float(FloatKind::E5M2),
+        ComponentTypeKHR::FLOAT16 => ElemType::Float(FloatKind::F16),
+        ComponentTypeKHR::BFLOAT16 => ElemType::Float(FloatKind::BF16),
+        ComponentTypeKHR::FLOAT32 => ElemType::Float(FloatKind::F32),
+        ComponentTypeKHR::FLOAT64 => ElemType::Float(FloatKind::F64),
+        ComponentTypeKHR::SINT8 => ElemType::Int(IntKind::I8),
+        ComponentTypeKHR::SINT16 => ElemType::Int(IntKind::I16),
+        ComponentTypeKHR::SINT32 => ElemType::Int(IntKind::I32),
+        ComponentTypeKHR::SINT64 => ElemType::Int(IntKind::I64),
+        ComponentTypeKHR::UINT8 => ElemType::UInt(UIntKind::U8),
+        ComponentTypeKHR::UINT16 => ElemType::UInt(UIntKind::U16),
+        ComponentTypeKHR::UINT32 => ElemType::UInt(UIntKind::U32),
+        ComponentTypeKHR::UINT64 => ElemType::UInt(UIntKind::U64),
         _ => None?,
     };
     Some(ty)

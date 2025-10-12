@@ -54,6 +54,7 @@ impl Optimizer {
             Operation::NonSemantic(non_semantic) => {
                 self.visit_nonsemantic(non_semantic, visit_read)
             }
+            Operation::Free(_) => {}
         }
     }
 
@@ -71,10 +72,13 @@ impl Optimizer {
                 visit_read(self, &mut fma_operator.c);
             }
             Arithmetic::Add(binary_operator)
+            | Arithmetic::SaturatingAdd(binary_operator)
             | Arithmetic::Sub(binary_operator)
+            | Arithmetic::SaturatingSub(binary_operator)
             | Arithmetic::Mul(binary_operator)
             | Arithmetic::Div(binary_operator)
             | Arithmetic::Powf(binary_operator)
+            | Arithmetic::Powi(binary_operator)
             | Arithmetic::Modulo(binary_operator)
             | Arithmetic::Max(binary_operator)
             | Arithmetic::Min(binary_operator)
@@ -122,6 +126,9 @@ impl Optimizer {
             | Comparison::Lower(binary_operator)
             | Comparison::GreaterEqual(binary_operator) => {
                 self.visit_binop(binary_operator, visit_read)
+            }
+            Comparison::IsNan(unary_operator) | Comparison::IsInf(unary_operator) => {
+                self.visit_unop(unary_operator, visit_read)
             }
         }
     }
@@ -308,6 +315,50 @@ impl Optimizer {
             }
             CoopMma::Cast { input } => {
                 visit_read(self, input);
+            }
+            CoopMma::RowIndex { lane_id, i, .. } => {
+                visit_read(self, lane_id);
+                visit_read(self, i);
+            }
+            CoopMma::ColIndex { lane_id, i, .. } => {
+                visit_read(self, lane_id);
+                visit_read(self, i);
+            }
+            CoopMma::ExecuteManual {
+                registers_a,
+                registers_b,
+                registers_c,
+                ..
+            } => {
+                for reg in registers_a {
+                    visit_read(self, reg);
+                }
+                for reg in registers_b {
+                    visit_read(self, reg);
+                }
+                for reg in registers_c {
+                    visit_read(self, reg);
+                }
+            }
+            CoopMma::ExecuteScaled {
+                registers_a,
+                registers_b,
+                registers_c,
+                scales_a,
+                scales_b,
+                ..
+            } => {
+                for reg in registers_a {
+                    visit_read(self, reg);
+                }
+                for reg in registers_b {
+                    visit_read(self, reg);
+                }
+                for reg in registers_c {
+                    visit_read(self, reg);
+                }
+                visit_read(self, scales_a);
+                visit_read(self, scales_b);
             }
         }
     }

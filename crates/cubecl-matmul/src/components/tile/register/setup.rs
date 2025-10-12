@@ -1,19 +1,27 @@
-use std::fmt::Display;
-
-use crate::components::error::MatmulSetupError;
-use crate::components::resource::ComputeResources;
-use crate::components::tile::TileMatmulFamily;
 use crate::components::tile::register::config::RegisterConfig;
 use crate::components::tile::register::matmul::RegisterMatmul;
+use crate::components::tile::{TileMatmulFamily, io::Strided};
 use crate::components::{
-    AvailableLineSizes, InvalidConfigError, MatmulLineSizes, MatmulPrecision, MatmulProblem,
-    MatmulSelection,
+    AvailableLineSizes, InvalidConfigError, MatmulLineSizes, MatmulProblem, MatmulSelection,
+};
+use crate::components::{error::MatmulSetupError, tile::io::TileKind};
+use crate::components::{
+    resource::ComputeResources,
+    tile::register::reader::{RegisterFragmentReader, RegisterStageReader},
 };
 use cubecl_core::prelude::*;
 
-impl TileMatmulFamily for RegisterMatmul {
-    type Matmul<MP: MatmulPrecision> = RegisterMatmul;
+impl<AccTile: TileKind> TileMatmulFamily for RegisterMatmul<AccTile>
+where
+    RegisterStageReader<AccTile>: RegisterFragmentReader<TileKind = AccTile>,
+{
+    type Matmul<L: Numeric, R: Numeric, A: Numeric> = RegisterMatmul<AccTile>;
     type Config = RegisterConfig;
+
+    type LhsTile = Strided;
+    type RhsTile = Strided;
+    type AccTile = AccTile;
+    type OutTile = Strided;
 
     fn requires_accelerator() -> bool {
         false
@@ -23,15 +31,15 @@ impl TileMatmulFamily for RegisterMatmul {
         Ok(ComputeResources::Units(1))
     }
 
-    fn setup<MP: MatmulPrecision, R: Runtime>(
+    fn setup<Lhs: Numeric, Rhs: Numeric, Acc: Numeric, R: Runtime>(
         client: &ComputeClient<R::Server, R::Channel>,
         problem: &MatmulProblem,
         selection: &MatmulSelection,
         matmul_line_sizes: &MatmulLineSizes,
     ) -> Result<Self::Config, MatmulSetupError> {
-        RegisterConfig::new::<MP, R>(
+        RegisterConfig::new::<Lhs, Rhs, Acc, R>(
             client,
-            selection.tiling_scheme,
+            selection.tiling_scheme.tile_size,
             selection.plane_dim,
             problem.lhs_layout,
             problem.rhs_layout,
@@ -48,16 +56,5 @@ impl TileMatmulFamily for RegisterMatmul {
             .filter_lhs(|ls| *ls <= 4)
             .filter_rhs(|ls| *ls <= 4)
             .filter_out(|ls| *ls <= 4)
-    }
-}
-
-pub struct RegisterMatmulConfigError {
-    func: Box<dyn Fn() -> String>,
-}
-
-impl Display for RegisterMatmulConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let string = (self.func)();
-        write!(f, "{string}")
     }
 }

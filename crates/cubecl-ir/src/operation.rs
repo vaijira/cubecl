@@ -1,6 +1,6 @@
 use core::fmt::Display;
 
-use super::{Branch, CoopMma, Item, NonSemantic, Plane, Synchronization, Variable};
+use super::{Branch, CoopMma, NonSemantic, Plane, Synchronization, Type, Variable};
 use crate::{
     Arithmetic, AtomicOp, Bitwise, Metadata, OperationArgs, OperationReflect, Operator, TmaOps,
     comparison::Comparison,
@@ -55,6 +55,9 @@ pub enum Operation {
     /// Non-semantic instructions (i.e. comments, debug info)
     #[operation(nested)]
     NonSemantic(NonSemantic),
+    /// Frees a shared memory, allowing reuse in later blocks. Only used as a marker for the shared
+    /// memory analysis, should be ignored by compilers.
+    Free(Variable),
 }
 
 /// An instruction that contains a right hand side [`Operation`] and an optional out variable.
@@ -87,8 +90,8 @@ impl Instruction {
         self.out.unwrap()
     }
 
-    pub fn item(&self) -> Item {
-        self.out().item
+    pub fn ty(&self) -> Type {
+        self.out().ty
     }
 }
 
@@ -113,20 +116,57 @@ impl Display for Instruction {
                 op.len
             ),
             Operation::Operator(Operator::IndexAssign(op)) => {
-                write!(f, "{}[{}] = {}", self.out(), op.index, op.value)
+                write!(
+                    f,
+                    "{}[{}] = {}  : ({}, {}) -> ({})",
+                    self.out(),
+                    op.index,
+                    op.value,
+                    op.index.ty,
+                    op.value.ty,
+                    self.out().ty,
+                )
             }
             Operation::Operator(Operator::UncheckedIndexAssign(op)) => {
-                write!(f, "unchecked {}[{}] = {}", self.out(), op.index, op.value)
+                write!(
+                    f,
+                    "unchecked {}[{}] = {} : ({}, {}) -> ({})",
+                    self.out(),
+                    op.index,
+                    op.value,
+                    op.index.ty,
+                    op.value.ty,
+                    self.out().ty,
+                )
             }
             Operation::Operator(Operator::Cast(op)) => {
-                write!(f, "{} = cast<{}>({})", self.out(), self.item(), op.input)
+                write!(
+                    f,
+                    "{} = cast<{}>({}) : ({}) -> ({})",
+                    self.out(),
+                    self.ty(),
+                    op.input,
+                    op.input.ty,
+                    self.out().ty,
+                )
             }
             Operation::Operator(Operator::Reinterpret(op)) => {
-                write!(f, "{} = bitcast<{}>({})", self.out(), self.item(), op.input)
+                write!(f, "{} = bitcast<{}>({})", self.out(), self.ty(), op.input)
             }
             _ => {
                 if let Some(out) = self.out {
-                    write!(f, "{out} = {}", self.operation)
+                    let mut vars_str = String::new();
+                    for (i, var) in self.operation.args().unwrap_or_default().iter().enumerate() {
+                        if i != 0 {
+                            vars_str.push_str(", ");
+                        }
+                        vars_str.push_str(&var.ty.to_string());
+                    }
+                    write!(
+                        f,
+                        "{out} = {} : ({}) -> ({})",
+                        self.operation, vars_str, out.ty
+                    )
                 } else {
                     write!(f, "{}", self.operation)
                 }
@@ -152,6 +192,7 @@ impl Display for Operation {
             Operation::NonSemantic(non_semantic) => write!(f, "{non_semantic}"),
             Operation::Barrier(barrier_ops) => write!(f, "{barrier_ops}"),
             Operation::Tma(tma_ops) => write!(f, "{tma_ops}"),
+            Operation::Free(var) => write!(f, "free({var})"),
         }
     }
 }
@@ -175,7 +216,8 @@ pub fn fmt_vararg(args: &[impl Display]) -> String {
 pub struct IndexOperator {
     pub list: Variable,
     pub index: Variable,
-    pub line_size: u32, // 0 == same as list.
+    pub line_size: u32,     // 0 == same as list.
+    pub unroll_factor: u32, // Adjustment factor for bounds check
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -185,7 +227,8 @@ pub struct IndexAssignOperator {
     // list is out.
     pub index: Variable,
     pub value: Variable,
-    pub line_size: u32, // 0 == same as list.
+    pub line_size: u32,     // 0 == same as list.
+    pub unroll_factor: u32, // Adjustment factor for bounds check
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

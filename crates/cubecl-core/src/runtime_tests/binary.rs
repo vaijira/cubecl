@@ -15,7 +15,7 @@ pub(crate) fn assert_equals_approx<
     expected: &[F],
     epsilon: f32,
 ) {
-    let actual = client.read_one(output.binding());
+    let actual = client.read_one(output);
     let actual = F::from_bytes(&actual);
 
     // normalize to type epsilon
@@ -27,7 +27,7 @@ pub(crate) fn assert_equals_approx<
         .enumerate()
     {
         // account for lower precision at higher values
-        let allowed_error = F::new((epsilon * e.to_f32().unwrap()).max(epsilon));
+        let allowed_error = F::new((epsilon * e.to_f32().unwrap().abs()).max(epsilon));
         assert!(
             (*a - *e).abs() < allowed_error || (a.is_nan() && e.is_nan()),
             "Values differ more than epsilon: actual={}, expected={}, difference={}, epsilon={}
@@ -58,7 +58,7 @@ macro_rules! test_binary_impl {
             expected: $expected:expr
         }),*]) => {
         pub fn $test_name<R: Runtime, $float_type: Float + num_traits::Float + CubeElement + Display>(client: ComputeClient<R::Server, R::Channel>) {
-            #[cube(launch_unchecked, fast_math = FastMath::all())]
+            #[cube(launch_unchecked, fast_math = FastMath::AllowTransform | FastMath::UnsignedZero)]
             fn test_function<$float_type: Float>(lhs: &Array<$float_type>, rhs: &Array<$float_type>, output: &mut Array<$float_type>) {
                 if ABSOLUTE_POS < rhs.len() {
                     output[ABSOLUTE_POS] = $binary_func(lhs[ABSOLUTE_POS], rhs[ABSOLUTE_POS]);
@@ -128,6 +128,98 @@ test_binary_impl!(
     ]
 );
 
+test_binary_impl!(
+    test_powf,
+    F,
+    F::powf,
+    [
+        {
+            input_vectorization: 2,
+            out_vectorization: 2,
+            lhs: as_type![F: 2., -3., 2., 81.],
+            rhs: as_type![F: 3., 2., -1., 0.5],
+            expected: as_type![F: 8., 9., 0.5, 9.]
+        },
+        {
+            input_vectorization: 4,
+            out_vectorization: 4,
+            lhs: as_type![F: 2., -3., 2., 81.],
+            rhs: as_type![F: 3., 2., -1., 0.5],
+            expected: as_type![F: 8., 9., 0.5, 9.]
+        }
+    ]
+);
+
+#[cube(launch_unchecked)]
+fn test_powi_kernel<F: Float>(
+    lhs: &Array<Line<F>>,
+    rhs: &Array<Line<i32>>,
+    output: &mut Array<Line<F>>,
+) {
+    if ABSOLUTE_POS < rhs.len() {
+        output[ABSOLUTE_POS] = Powi::powi(lhs[ABSOLUTE_POS], rhs[ABSOLUTE_POS]);
+    }
+}
+
+macro_rules! test_powi_impl {
+    (
+        $test_name:ident,
+        $float_type:ident,
+        [$({
+            input_vectorization: $input_vectorization:expr,
+            out_vectorization: $out_vectorization:expr,
+            lhs: $lhs:expr,
+            rhs: $rhs:expr,
+            expected: $expected:expr
+        }),*]) => {
+        pub fn $test_name<R: Runtime, $float_type: Float + num_traits::Float + CubeElement + Display>(client: ComputeClient<R::Server, R::Channel>) {
+            $(
+            {
+                let lhs = $lhs;
+                let rhs = $rhs;
+                let output_handle = client.empty($expected.len() * core::mem::size_of::<$float_type>());
+                let lhs_handle = client.create($float_type::as_bytes(lhs));
+                let rhs_handle = client.create(i32::as_bytes(rhs));
+
+                unsafe {
+                    test_powi_kernel::launch_unchecked::<F, R>(
+                        &client,
+                        CubeCount::Static(1, 1, 1),
+                        CubeDim::new((lhs.len() / $input_vectorization as usize) as u32, 1, 1),
+                        ArrayArg::from_raw_parts::<$float_type>(&lhs_handle, lhs.len(), $input_vectorization),
+                        ArrayArg::from_raw_parts::<i32>(&rhs_handle, rhs.len(), $input_vectorization),
+                        ArrayArg::from_raw_parts::<$float_type>(&output_handle, $expected.len(), $out_vectorization),
+                    )
+                };
+
+                assert_equals_approx::<R, F>(&client, output_handle, $expected, 0.001);
+            }
+            )*
+        }
+    };
+}
+
+test_powi_impl!(
+    test_powi,
+    F,
+    [
+        {
+            input_vectorization: 2,
+            out_vectorization: 2,
+            lhs: as_type![F: 2., -3., 2., 81.],
+            rhs: as_type![i32: 3, 2, -1, 1],
+            expected: as_type![F: 8., 9., 0.5, 81.]
+        },
+        {
+            input_vectorization: 4,
+            out_vectorization: 4,
+            lhs: as_type![F: 2., -3., 2., 81.],
+            rhs: as_type![i32: 3, 2, -1, 1],
+            expected: as_type![F: 8., 9., 0.5, 81.]
+        }
+    ]
+);
+
 #[cube(launch_unchecked)]
 fn test_mulhi_kernel(
     lhs: &Array<Line<u32>>,
@@ -169,7 +261,7 @@ macro_rules! test_mulhi_impl {
                     )
                 };
 
-                let actual = client.read_one(output_handle.binding());
+                let actual = client.read_one(output_handle);
                 let actual = u32::from_bytes(&actual);
                 let expected: &[u32] = $expected;
 
@@ -227,6 +319,8 @@ macro_rules! testgen_binary {
             }
 
             add_test!(test_dot);
+            add_test!(test_powf);
+            add_test!(test_powi);
         }
     };
 }
@@ -244,6 +338,13 @@ macro_rules! testgen_binary_untyped {
                     fn $test_name() {
                         let client = TestRuntime::client(&Default::default());
                         cubecl_core::runtime_tests::binary::$test_name::<TestRuntime>(client);
+                    }
+                };
+                ($test_name:ident, $ty:ty) => {
+                    #[test]
+                    fn $test_name() {
+                        let client = TestRuntime::client(&Default::default());
+                        cubecl_core::runtime_tests::binary::$test_name::<TestRuntime, $ty>(client);
                     }
                 };
             }

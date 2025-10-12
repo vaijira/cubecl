@@ -1,12 +1,11 @@
-use cubecl_core::Feature;
-use cubecl_core::ir::{self as gpu};
-use cubecl_runtime::DeviceProperties;
-use std::fmt::Display;
+use cubecl_runtime::{DeviceProperties, MmaConfig, ScaledMmaConfig};
+use std::fmt::{Display, Formatter};
 use std::{fmt::Debug, marker::PhantomData};
 
-use super::{Component, Dialect, Elem, Variable};
+use super::{Component, Dialect, Elem, FmtLeft, Variable};
 
-pub type SupportedWmmaCombinations = Vec<(gpu::Elem, gpu::Elem, gpu::Elem, Vec<(u8, u8, u8)>)>;
+pub type SupportedMmaCombinations = Vec<MmaConfig>;
+pub type SupportedScaledMmaCombinations = Vec<ScaledMmaConfig>;
 
 pub trait Architecture {
     fn warp_size(&self) -> u32;
@@ -18,20 +17,29 @@ pub trait Architecture {
 }
 
 pub fn register_wmma_features(
-    supported_combinations: SupportedWmmaCombinations,
-    properties: &mut DeviceProperties<Feature>,
+    supported_combinations: SupportedMmaCombinations,
+    properties: &mut DeviceProperties,
 ) {
-    for (i, o, c, tdims) in supported_combinations {
-        for (m, n, k) in tdims {
-            properties.register_feature(Feature::Cmma {
-                a: i,
-                b: o,
-                c,
-                m,
-                n,
-                k,
-            });
-        }
+    for config in supported_combinations {
+        properties.features.cmma.insert(config);
+    }
+}
+
+pub fn register_mma_features(
+    supported_combinations: SupportedMmaCombinations,
+    properties: &mut DeviceProperties,
+) {
+    for config in supported_combinations {
+        properties.features.mma.insert(config);
+    }
+}
+
+pub fn register_scaled_mma_features(
+    supported_combinations: SupportedScaledMmaCombinations,
+    properties: &mut DeviceProperties,
+) {
+    for config in supported_combinations {
+        properties.features.scaled_mma.insert(config);
     }
 }
 
@@ -53,15 +61,34 @@ pub enum FragmentLayout<D: Dialect> {
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub struct Fragment<D: Dialect> {
     pub ident: FragmentIdent<D>,
-    pub m: u8,
-    pub n: u8,
-    pub k: u8,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
     pub elem: Elem<D>,
     pub layout: Option<FragmentLayout<D>>,
 }
 
+#[derive(new, Debug, Clone, PartialEq, Eq, Copy)]
+pub struct MmaShape<D: Dialect> {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    _d: PhantomData<D>,
+}
+
+impl<D: Dialect> MmaShape<D> {
+    pub fn num_elems(&self, ident: FragmentIdent<D>) -> u32 {
+        match ident {
+            FragmentIdent::A => self.m * self.k,
+            FragmentIdent::B => self.k * self.n,
+            FragmentIdent::Accumulator => self.m * self.n,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 /// Warp Matrix-Multiply and Accumulate Instruction.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WmmaInstruction<D: Dialect> {
     /// Fill the fragment with the value.
     Fill {
@@ -85,6 +112,36 @@ pub enum WmmaInstruction<D: Dialect> {
         frag_c: Variable<D>,
         frag_d: Variable<D>,
         warp_size: u32,
+    },
+    /// Executes D=A*B+C using manually managed registers;
+    ///
+    /// For implementing a matmul, `D=C` : `C+=A*B`
+    /// Takes a sequence of registers for the inputs, and returns an array of registers for the
+    /// output. PTX requires output registers to be non-overlapping, so we use array to ensure that
+    /// and handle potentially destructuring it internally.
+    ExecuteManual {
+        shape: MmaShape<D>,
+        frag_a: Vec<Variable<D>>,
+        frag_b: Vec<Variable<D>>,
+        frag_c: Vec<Variable<D>>,
+        frag_d: Variable<D>,
+    },
+    /// Executes D=A*B+C using manually managed registers;
+    ///
+    /// For implementing a matmul, `D=C` : `C+=A*B`
+    /// Takes a sequence of registers for the inputs, and returns an array of registers for the
+    /// output. PTX requires output registers to be non-overlapping, so we use array to ensure that
+    /// and handle potentially destructuring it internally.
+    ExecuteScaled {
+        shape: MmaShape<D>,
+        frag_a: Vec<Variable<D>>,
+        frag_b: Vec<Variable<D>>,
+        frag_c: Vec<Variable<D>>,
+        frag_d: Variable<D>,
+
+        scales_a: Variable<D>,
+        scales_b: Variable<D>,
+        scales_factor: u32,
     },
     /// Store the fragment in an output variable following the stride and the layout.
     Store {
@@ -126,6 +183,8 @@ impl<D: Dialect> Display for WmmaInstruction<D> {
 }
 
 pub mod wmma_api_base {
+    use crate::shared::ManualMma;
+
     use super::*;
 
     pub fn compile_fragment_declaration<D: Dialect>(
@@ -202,7 +261,6 @@ pub mod wmma_api_base {
             WmmaInstruction::Fill { frag, value } => {
                 writeln!(f, "{namespace}::fill_fragment({frag}, {value});")
             }
-
             WmmaInstruction::Load {
                 frag,
                 value,
@@ -225,7 +283,6 @@ pub mod wmma_api_base {
                     )
                 }
             }
-
             WmmaInstruction::Load {
                 frag,
                 value,
@@ -252,7 +309,6 @@ pub mod wmma_api_base {
                     )
                 }
             }
-
             WmmaInstruction::Execute {
                 frag_a,
                 frag_b,
@@ -263,7 +319,6 @@ pub mod wmma_api_base {
                 f,
                 "{namespace}::mma_sync({frag_d}, {frag_a}, {frag_b}, {frag_c});"
             ),
-
             WmmaInstruction::Store {
                 output,
                 frag,
@@ -326,6 +381,78 @@ for(int t=0; t<{input}.num_elements; t++) {{ {output}.x[t] = {ty}({input}.x[t]);
                     }
                 }
             }
+            WmmaInstruction::ExecuteManual {
+                shape,
+                frag_a,
+                frag_b,
+                frag_c,
+                frag_d,
+            } => D::compile_manual_mma(f, ManualMma::new(*shape, frag_a, frag_b, frag_c, frag_d)),
+            WmmaInstruction::ExecuteScaled {
+                shape,
+                frag_a,
+                frag_b,
+                frag_c,
+                frag_d,
+                scales_a,
+                scales_b,
+                scales_factor,
+            } => D::compile_scaled_mma(
+                f,
+                ManualMma::new(*shape, frag_a, frag_b, frag_c, frag_d),
+                *scales_a,
+                *scales_b,
+                *scales_factor,
+            ),
         }
+    }
+}
+
+pub fn frag_as_ptr<D: Dialect>(
+    f: &mut Formatter<'_>,
+    frag: &Variable<D>,
+    offset: &Variable<D>,
+) -> Variable<D> {
+    let item = frag.item();
+    let mut frag_ptr = Variable::tmp_ptr(item);
+    if frag.is_const() {
+        frag_ptr.to_const();
+    }
+    let frag_ptr_out = frag_ptr.fmt_left();
+    writeln!(f, "{frag_ptr_out} = {frag} + {offset};").unwrap();
+
+    if item.vectorization > 1 {
+        let mut item_value = item;
+        item_value.vectorization = 1;
+        frag_ptr.reinterpret_ptr(f, item_value)
+    } else {
+        frag_ptr
+    }
+}
+
+pub fn frag_ident_str<D: Dialect>(frag: &FragmentIdent<D>) -> &str {
+    match frag {
+        FragmentIdent::A => "a",
+        FragmentIdent::B => "b",
+        FragmentIdent::Accumulator => "c",
+        FragmentIdent::_Dialect(_) => "d",
+    }
+}
+
+pub fn frag_layout_str<D: Dialect>(frag: &Option<FragmentLayout<D>>) -> &str {
+    match frag {
+        Some(layout) => match layout {
+            FragmentLayout::ColMajor => "col",
+            FragmentLayout::RowMajor => "row",
+            FragmentLayout::_Dialect(_) => "",
+        },
+        None => "",
+    }
+}
+
+pub fn variable_to_frag<D: Dialect>(frag: &Variable<D>) -> Fragment<D> {
+    match frag {
+        Variable::WmmaFragment { frag, .. } => *frag,
+        _ => panic!(),
     }
 }

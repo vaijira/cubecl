@@ -5,15 +5,17 @@ use crate::{
     Dialect,
     shared::{
         self, AtomicKind, Binding, Component, CubeIndexFlags, DialectBindings, DialectCubeBuiltins,
-        DialectIncludes, DialectInstructions, DialectTypes, DialectWmmaCompiler, Elem, Flags,
-        FmtLeft, Fragment, FragmentIdent, FragmentLayout, Instruction, Item, SharedMemory,
-        SupportedWmmaCombinations, Variable, WarpInstruction, WmmaInstruction, wmma_api_base,
+        DialectIncludes, DialectInstructions, DialectProcessors, DialectTypes,
+        DialectWarpReduceCompiler, DialectWmmaCompiler, Elem, Flags, FmtLeft, Fragment,
+        FragmentIdent, FragmentLayout, Instruction, Item, ManualMma, SharedMemory,
+        SupportedMmaCombinations, Variable, WarpInstruction, WmmaInstruction, wmma_api_base,
     },
 };
 use cubecl_core::{
     compute::{Location, Visibility},
-    ir::{self as gpu, Id},
+    ir::{self as gpu},
 };
+use cubecl_runtime::MmaConfig;
 
 use super::{
     AddressSpace, Extension,
@@ -29,6 +31,97 @@ pub struct MslDialect {}
 
 impl Dialect for MslDialect {
     type Architecture = MetalArchitecture;
+}
+
+impl DialectWarpReduceCompiler<Self> for MslDialect {
+    fn warp_reduce_sum(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!("{out} = simd_sum({input});\n"))
+    }
+    fn warp_reduce_prod(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!("{out} = simd_product({input});\n"))
+    }
+    fn warp_reduce_max(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!("{out} = simd_max({input});\n"))
+    }
+    fn warp_reduce_min(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!("{out} = simd_min({input});\n"))
+    }
+    fn warp_reduce_all(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!("{out} = simd_and({input});\n"))
+    }
+    fn warp_reduce_any(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!("{out} = simd_or({input});\n"))
+    }
+    fn warp_reduce_sum_inclusive(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!(
+            "{out} = simd_prefix_inclusive_sum({input});\n"
+        ))
+    }
+    fn warp_reduce_prod_inclusive(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!(
+            "{out} = simd_prefix_inclusive_product({input});\n"
+        ))
+    }
+    fn warp_reduce_sum_exclusive(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!(
+            "{out} = simd_prefix_exclusive_sum({input});\n"
+        ))
+    }
+    fn warp_reduce_prod_exclusive(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<Self>,
+        out: &Variable<Self>,
+    ) -> core::fmt::Result {
+        let out = out.fmt_left();
+        f.write_fmt(format_args!(
+            "{out} = simd_prefix_exclusive_product({input});\n"
+        ))
+    }
 }
 
 // Includes
@@ -230,14 +323,13 @@ struct alignas({alignment}) {item} {{"
     ) -> std::fmt::Result {
         let item = shared.item;
         let index = shared.index;
-        let size = shared.size;
-        let alignment = shared
-            .align
-            .map(|align| format!("alignas({align})"))
-            .unwrap_or_default();
+        let offset = shared.offset;
+        let size = shared.length;
+        let size_bytes = size * shared.item.size() as u32;
+        writeln!(f, "// Shared memory size: {size}, {size_bytes} bytes")?;
         writeln!(
             f,
-            "threadgroup {alignment} {item} shared_memory_{index}[{size}];",
+            "threadgroup {item}* shared_memory_{index} = reinterpret_cast<threadgroup {item}*>(&dynamic_shared_mem[{offset}]);"
         )
     }
 }
@@ -248,7 +340,7 @@ impl DialectBindings<Self> for MslDialect {
     fn compile_kernel_signature(
         f: &mut std::fmt::Formatter<'_>,
         kernel_name: &str,
-        tensor_maps: &[Id],
+        tensor_maps: &[Binding<Self>],
         buffers: &[Binding<Self>],
         scalars: &[(Elem<Self>, usize)],
         flags: &Flags,
@@ -324,6 +416,23 @@ void {kernel_name}("
             .filter(|(cond, _)| *cond)
             .try_for_each(|(_, var)| format_metal_builtin_binding_arg(f, var, comma))?;
         f.write_str("\n)")
+    }
+
+    fn compile_bindings_body(
+        f: &mut std::fmt::Formatter<'_>,
+        body: &shared::Body<Self>,
+    ) -> std::fmt::Result {
+        if !body.shared_memories.is_empty() {
+            let size = body
+                .shared_memories
+                .iter()
+                .map(|it| it.offset + it.size())
+                .max()
+                .unwrap();
+
+            writeln!(f, "threadgroup uchar dynamic_shared_mem[{size}];",)?;
+        }
+        Ok(())
     }
 }
 
@@ -658,22 +767,36 @@ impl DialectInstructions<Self> for MslDialect {
         )
     }
 
+    fn compile_saturating_add(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: impl Display,
+        rhs: impl Display,
+        _item: Item<Self>,
+    ) -> std::fmt::Result {
+        write!(f, "addsat({lhs}, {rhs})")
+    }
+
+    fn compile_saturating_sub(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: impl Display,
+        rhs: impl Display,
+        _item: Item<Self>,
+    ) -> std::fmt::Result {
+        write!(f, "subsat({lhs}, {rhs})")
+    }
+
     // debug
     fn compile_instruction_printf(
         f: &mut std::fmt::Formatter<'_>,
         format_string: &str,
         args: &[Variable<Self>],
     ) -> std::fmt::Result {
-        let format_string = format_string
-            .replace("\t", "\\t")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r");
         let args = args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>();
         let args = match args.is_empty() {
             true => "".to_string(),
             false => format!(", {}", args.join(",")),
         };
-        writeln!(f, "os_log_default.log(\"{format_string}\"{args});")
+        writeln!(f, "os_log_default.log({format_string:?}{args});")
     }
 
     // logs
@@ -779,8 +902,13 @@ impl DialectInstructions<Self> for MslDialect {
         write!(f, "min")
     }
 
-    fn compile_instruction_powf(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "pow")
+    fn compile_instruction_powf(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: &str,
+        rhs: &str,
+        elem: Elem<Self>,
+    ) -> std::fmt::Result {
+        write!(f, "pow({lhs}, {elem}({rhs}))")
     }
 
     fn compile_instruction_half_function_name_prefix() -> &'static str {
@@ -851,13 +979,8 @@ impl DialectInstructions<Self> for MslDialect {
 // Coop Matrices dialect
 
 impl DialectWmmaCompiler<Self> for MslDialect {
-    fn compile_wmma_includes(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn compile_wmma_includes(f: &mut std::fmt::Formatter<'_>, _flags: &Flags) -> std::fmt::Result {
         writeln!(f, "#include <metal_simdgroup_matrix>")
-    }
-
-    fn compile_wmma_type_definitions(_f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // not used
-        Ok(())
     }
 
     fn compile_wmma_local_variables(_f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1015,37 +1138,96 @@ impl DialectWmmaCompiler<Self> for MslDialect {
                     }
                 }
             }
+            WmmaInstruction::ExecuteManual {
+                shape,
+                frag_a,
+                frag_b,
+                frag_c,
+                frag_d,
+            } => {
+                Self::compile_manual_mma(f, ManualMma::new(*shape, frag_a, frag_b, frag_c, frag_d))
+            }
+            WmmaInstruction::ExecuteScaled {
+                shape,
+                frag_a,
+                frag_b,
+                frag_c,
+                frag_d,
+                scales_a,
+                scales_b,
+                scales_factor,
+            } => Self::compile_scaled_mma(
+                f,
+                ManualMma::new(*shape, frag_a, frag_b, frag_c, frag_d),
+                *scales_a,
+                *scales_b,
+                *scales_factor,
+            ),
         }
     }
 
-    fn supported_wmma_combinations(_arch: &MetalArchitecture) -> SupportedWmmaCombinations {
-        vec![
+    fn compile_manual_mma(
+        _f: &mut std::fmt::Formatter<'_>,
+        _mma: shared::ManualMma<Self>,
+    ) -> std::fmt::Result {
+        unimplemented!("Not supported")
+    }
+
+    fn compile_scaled_mma(
+        _f: &mut std::fmt::Formatter<'_>,
+        _mma: shared::ManualMma<Self>,
+        _scales_a: Variable<Self>,
+        _scales_b: Variable<Self>,
+        _scales_factor: u32,
+    ) -> std::fmt::Result {
+        unimplemented!("Not supported")
+    }
+
+    fn supported_wmma_combinations(_arch: &MetalArchitecture) -> SupportedMmaCombinations {
+        let types = vec![
             (
-                gpu::Elem::Float(gpu::FloatKind::F16),
-                gpu::Elem::Float(gpu::FloatKind::F16),
-                gpu::Elem::Float(gpu::FloatKind::F16),
-                vec![(8, 8, 8)],
+                gpu::ElemType::Float(gpu::FloatKind::F16).into(),
+                gpu::ElemType::Float(gpu::FloatKind::F16).into(),
+                gpu::ElemType::Float(gpu::FloatKind::F16).into(),
             ),
             (
-                gpu::Elem::Float(gpu::FloatKind::F16),
-                gpu::Elem::Float(gpu::FloatKind::F16),
-                gpu::Elem::Float(gpu::FloatKind::F32),
-                vec![(8, 8, 8)],
+                gpu::ElemType::Float(gpu::FloatKind::F16).into(),
+                gpu::ElemType::Float(gpu::FloatKind::F16).into(),
+                gpu::ElemType::Float(gpu::FloatKind::F32).into(),
             ),
             (
-                gpu::Elem::Float(gpu::FloatKind::BF16),
-                gpu::Elem::Float(gpu::FloatKind::BF16),
-                gpu::Elem::Float(gpu::FloatKind::BF16),
-                vec![(8, 8, 8)],
+                gpu::ElemType::Float(gpu::FloatKind::BF16).into(),
+                gpu::ElemType::Float(gpu::FloatKind::BF16).into(),
+                gpu::ElemType::Float(gpu::FloatKind::BF16).into(),
             ),
             (
-                gpu::Elem::Float(gpu::FloatKind::F32),
-                gpu::Elem::Float(gpu::FloatKind::F32),
-                gpu::Elem::Float(gpu::FloatKind::F32),
-                vec![(8, 8, 8)],
+                gpu::ElemType::Float(gpu::FloatKind::F32).into(),
+                gpu::ElemType::Float(gpu::FloatKind::F32).into(),
+                gpu::ElemType::Float(gpu::FloatKind::F32).into(),
             ),
-        ]
+        ];
+        types
+            .into_iter()
+            .map(|(a_type, b_type, cd_type)| MmaConfig {
+                a_type,
+                b_type,
+                cd_type,
+                m: 8,
+                n: 8,
+                k: 8,
+            })
+            .collect()
+    }
+
+    fn supported_mma_combinations(_arch: &MetalArchitecture) -> SupportedMmaCombinations {
+        Vec::new()
     }
 }
 
 // Coop Matrices dialect
+
+impl DialectProcessors<Self> for MslDialect {
+    fn processors() -> Vec<Box<dyn gpu::Processor>> {
+        Vec::new()
+    }
+}

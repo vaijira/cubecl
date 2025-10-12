@@ -1,5 +1,7 @@
 use core::fmt::Display;
 
+use crate::config::memory::MemoryLogLevel;
+use crate::config::streaming::StreamingLogLevel;
 use crate::config::{Logger, compilation::CompilationLogLevel, profiling::ProfilingLogLevel};
 use alloc::format;
 use alloc::string::String;
@@ -13,6 +15,8 @@ use super::{ProfileLevel, Profiled};
 enum LogMessage {
     Execution(String),
     Compilation(String),
+    Streaming(String),
+    Memory(String),
     Profile(String, ProfileDuration),
     ProfileSummary,
 }
@@ -22,7 +26,9 @@ enum LogMessage {
 pub struct ServerLogger {
     profile_level: Option<ProfileLevel>,
     log_compile_info: bool,
+    log_streaming: StreamingLogLevel,
     log_channel: Option<Sender<LogMessage>>,
+    log_memory: MemoryLogLevel,
 }
 
 impl Default for ServerLogger {
@@ -35,13 +41,19 @@ impl Default for ServerLogger {
         ) && matches!(
             logger.config.profiling.logger.level,
             ProfilingLogLevel::Disabled
-        );
+        ) && matches!(logger.config.memory.logger.level, MemoryLogLevel::Disabled)
+            && matches!(
+                logger.config.streaming.logger.level,
+                StreamingLogLevel::Disabled
+            );
 
         if disabled {
             return Self {
                 profile_level: None,
                 log_compile_info: false,
+                log_streaming: StreamingLogLevel::Disabled,
                 log_channel: None,
+                log_memory: MemoryLogLevel::Disabled,
             };
         }
         let profile_level = match logger.config.profiling.logger.level {
@@ -57,6 +69,8 @@ impl Default for ServerLogger {
             CompilationLogLevel::Basic => true,
             CompilationLogLevel::Full => true,
         };
+        let log_streaming = logger.config.streaming.logger.level;
+        let log_memory = logger.config.memory.logger.level;
 
         let (send, rec) = async_channel::unbounded();
 
@@ -72,6 +86,8 @@ impl Default for ServerLogger {
         Self {
             profile_level,
             log_compile_info,
+            log_streaming,
+            log_memory,
             log_channel: Some(send),
         }
     }
@@ -93,41 +109,69 @@ impl ServerLogger {
     where
         I: Display,
     {
-        if let Some(channel) = &self.log_channel {
-            if self.log_compile_info {
-                // Channel will never be full, don't care if it's closed.
-                let _ = channel.try_send(LogMessage::Compilation(arg.to_string()));
-            }
+        if let Some(channel) = &self.log_channel
+            && self.log_compile_info
+        {
+            // Channel will never be full, don't care if it's closed.
+            let _ = channel.try_send(LogMessage::Compilation(arg.to_string()));
+        }
+    }
+
+    /// Log the argument to the logger when the streaming logger is activated.
+    pub fn log_streaming<I: FnOnce() -> String, C: FnOnce(StreamingLogLevel) -> bool>(
+        &self,
+        cond: C,
+        format: I,
+    ) {
+        if let Some(channel) = &self.log_channel
+            && cond(self.log_streaming)
+        {
+            // Channel will never be full, don't care if it's closed.
+            let _ = channel.try_send(LogMessage::Streaming(format()));
+        }
+    }
+
+    /// Log the argument to the logger when the memory logger is activated.
+    pub fn log_memory<I: FnOnce() -> String, C: FnOnce(MemoryLogLevel) -> bool>(
+        &self,
+        cond: C,
+        format: I,
+    ) {
+        if let Some(channel) = &self.log_channel
+            && cond(self.log_memory)
+        {
+            // Channel will never be full, don't care if it's closed.
+            let _ = channel.try_send(LogMessage::Memory(format()));
         }
     }
 
     /// Register a profiled task without timing.
     pub fn register_execution(&self, name: impl Display) {
-        if let Some(channel) = &self.log_channel {
-            if matches!(self.profile_level, Some(ProfileLevel::ExecutionOnly)) {
-                // Channel will never be full, don't care if it's closed.
-                let _ = channel.try_send(LogMessage::Execution(name.to_string()));
-            }
+        if let Some(channel) = &self.log_channel
+            && matches!(self.profile_level, Some(ProfileLevel::ExecutionOnly))
+        {
+            // Channel will never be full, don't care if it's closed.
+            let _ = channel.try_send(LogMessage::Execution(name.to_string()));
         }
     }
 
     /// Register a profiled task.
     pub fn register_profiled(&self, name: impl Display, duration: ProfileDuration) {
-        if let Some(channel) = &self.log_channel {
-            if self.profile_level.is_some() {
-                // Channel will never be full, don't care if it's closed.
-                let _ = channel.try_send(LogMessage::Profile(name.to_string(), duration));
-            }
+        if let Some(channel) = &self.log_channel
+            && self.profile_level.is_some()
+        {
+            // Channel will never be full, don't care if it's closed.
+            let _ = channel.try_send(LogMessage::Profile(name.to_string(), duration));
         }
     }
 
     /// Show the profiling summary if activated and reset its state.
     pub fn profile_summary(&self) {
-        if let Some(channel) = &self.log_channel {
-            if self.profile_level.is_some() {
-                // Channel will never be full, don't care if it's closed.
-                let _ = channel.try_send(LogMessage::ProfileSummary);
-            }
+        if let Some(channel) = &self.log_channel
+            && self.profile_level.is_some()
+        {
+            // Channel will never be full, don't care if it's closed.
+            let _ = channel.try_send(LogMessage::ProfileSummary);
         }
     }
 }
@@ -144,6 +188,12 @@ impl AsyncLogger {
             match msg {
                 LogMessage::Compilation(msg) => {
                     self.logger.log_compilation(&msg);
+                }
+                LogMessage::Streaming(msg) => {
+                    self.logger.log_streaming(&msg);
+                }
+                LogMessage::Memory(msg) => {
+                    self.logger.log_memory(&msg);
                 }
                 LogMessage::Profile(name, profile) => {
                     let duration = profile.resolve().await.duration();

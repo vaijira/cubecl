@@ -1,15 +1,15 @@
-use cubecl_core::{Runtime, client::ComputeClient, ir::Elem};
+use cubecl_core::{Runtime, client::ComputeClient};
 
 use crate::{
     components::{
-        MatmulProblem, MatmulSelection,
+        MatmulElems, MatmulLineSizes, MatmulProblem, MatmulSelection, MatmulSetupError,
         batch::{PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
         global::{
-            load::sync_partial_cyclic::SyncPartialCyclicLoading,
-            multi_stage::double_buffering::DoubleBufferingMatmulFamily,
+            UnitWriterFamily, multi_stage::double_buffering::DoubleBufferingMatmulFamily,
+            read::sync_partial_cyclic::SyncPartialCyclicLoading,
         },
-        stage::{PartialReaderFamily, RowMajorTilingOrder, UnitMatmulFamily},
-        tile::register::RegisterMatmul,
+        stage::{FilledStageFamily, RowMajorTilingOrder, StridedStageFamily, UnitMatmulFamily},
+        tile::{io::Filled, register::RegisterMatmul},
     },
     kernels::layered::{
         Algorithm,
@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-/// Unit double buffered matmul with cyclic loaders
+/// Unit double buffered matmul with cyclic readers
 pub struct DoubleUnitAlgorithm {}
 
 #[derive(Default, Clone, Debug)]
@@ -27,12 +27,13 @@ pub struct DoubleUnitSelectionArgs {
 
 impl Algorithm for DoubleUnitAlgorithm {
     type SelectionArgs = DoubleUnitSelectionArgs;
-    type TileMatmul = RegisterMatmul;
-    type StageMatmul = UnitMatmulFamily<Self::TileMatmul, PartialReaderFamily>;
+    type TileMatmul = RegisterMatmul<Filled>;
+    type StageMatmul = UnitMatmulFamily<Self::TileMatmul, StridedStageFamily, FilledStageFamily>;
     type GlobalMatmul = DoubleBufferingMatmulFamily<
         Self::StageMatmul,
         SyncPartialCyclicLoading<RowMajorTilingOrder>,
         SyncPartialCyclicLoading<RowMajorTilingOrder>,
+        UnitWriterFamily,
     >;
     type BatchMatmul =
         PartitionedBatchMatmulFamily<Self::GlobalMatmul, RowMajorGlobalPartitionMatmul>;
@@ -41,11 +42,11 @@ impl Algorithm for DoubleUnitAlgorithm {
         client: &ComputeClient<R::Server, R::Channel>,
         problem: &MatmulProblem,
         plane_dim: u32,
-        _elem_stage: Elem,
-        _elem_acc: Elem,
+        _line_sizes: &MatmulLineSizes,
+        _elems: MatmulElems,
         args: &Self::SelectionArgs,
-    ) -> MatmulSelection {
-        unit_matmul_selection::<R>(
+    ) -> Result<MatmulSelection, MatmulSetupError> {
+        Ok(unit_matmul_selection::<R>(
             client,
             problem,
             plane_dim,
@@ -54,7 +55,7 @@ impl Algorithm for DoubleUnitAlgorithm {
                 tile: args.tile_size,
                 ..Default::default()
             },
-        )
+        ))
     }
 
     fn select_plane_dim<R: Runtime>(client: &ComputeClient<R::Server, R::Channel>) -> u32 {

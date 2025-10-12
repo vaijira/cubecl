@@ -107,7 +107,7 @@ fn mgs_normalize_reduce<F: Float>(
     let block = b + pivot;
     let mut q_block_index = 0;
 
-    let mut shared_q = SharedMemory::<F>::new(32 * 32);
+    let mut shared_v = SharedMemory::<F>::new(32 * 32);
     let mut pivots = SharedMemory::<F>::new(32 * 32);
     let mut sums = SharedMemory::<F>::new(32);
     let mut new_pivot_norm_l2 = SharedMemory::<F>::new(1);
@@ -115,22 +115,22 @@ fn mgs_normalize_reduce<F: Float>(
     for i in 0..rounds {
         if q_block_index + j >= rows {
             // exclude extra threads in last round
-            shared_q[j] = F::from_int(0);
+            shared_v[j] = F::from_int(0);
         } else {
             pivots[j] = q[pivot * rows + j + q_block_index];
-            shared_q[j] = pivots[j] * pivots[j];
+            shared_v[j] = pivots[j] * pivots[j];
         }
         sync_cube();
         let mut pow_of_two = 1; // partial sums for the norm
         for _ in 0..block_size_log2 {
             if j % (pow_of_two * 2) == 0 && j + pow_of_two < block_size {
-                shared_q[j] = shared_q[j] + shared_q[j + pow_of_two];
+                shared_v[j] = shared_v[j] + shared_v[j + pow_of_two];
             }
             pow_of_two *= 2;
             sync_cube();
         }
         if j == 0 {
-            sums[i] = shared_q[0];
+            sums[i] = shared_v[0];
         }
         sync_cube();
         q_block_index += block_size;
@@ -180,22 +180,22 @@ fn mgs_normalize_reduce<F: Float>(
         if block != pivot {
             // nonpivot blocks make inner product
             if q_block_index + j >= rows {
-                shared_q[j] = F::from_int(0);
+                shared_v[j] = F::from_int(0);
             } else {
-                shared_q[j] = q[block * rows + j + q_block_index];
-                shared_q[j] = pivots[j] * shared_q[j];
+                shared_v[j] = q[block * rows + j + q_block_index];
+                shared_v[j] = pivots[j] * shared_v[j];
             }
             sync_cube();
             let mut pow_of_two = 1; // partial sums for inner product
             for _ in 0..block_size_log2 {
                 if j % (pow_of_two * 2) == 0 && j + pow_of_two < block_size {
-                    shared_q[j] = shared_q[j] + shared_q[j + pow_of_two];
+                    shared_v[j] = shared_v[j] + shared_v[j + pow_of_two];
                 }
                 pow_of_two *= 2;
                 sync_cube();
             }
             if j == 0 {
-                sums[i] = shared_q[0];
+                sums[i] = shared_v[0];
             }
             sync_cube();
         }
@@ -219,9 +219,9 @@ fn mgs_normalize_reduce<F: Float>(
             // perform reduction
             if q_block_index + j < rows {
                 pivots[j] = q[pivot * rows + j + q_block_index];
-                shared_q[j] = q[block * rows + j + q_block_index];
-                shared_q[j] -= sums[0] * pivots[j] / new_pivot_norm_l2[0];
-                q[block * rows + j + q_block_index] = shared_q[j];
+                shared_v[j] = q[block * rows + j + q_block_index];
+                shared_v[j] -= sums[0] * pivots[j] / new_pivot_norm_l2[0];
+                q[block * rows + j + q_block_index] = shared_v[j];
             }
             sync_cube();
             q_block_index += block_size;
@@ -284,7 +284,7 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
         let pivot_norm_l2 = unsafe {
             ArrayArg::<R>::from_raw_parts::<E>(&handle_pivot_norm_l2, 1, vectorization_factor)
         };
-        let block_size_log2 = 32 - block_size.leading_zeros(); // ceil of log2
+        let block_size_log2 = block_size - block_size.leading_zeros(); // ceil of log2
         let cube_count = CubeCount::new_1d((q.shape[1] - pivot) as u32);
         /* println!(
             "loop with pivot {} block_size_log2 {} cube_count {} and rounds {}",

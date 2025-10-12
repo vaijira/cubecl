@@ -1,3 +1,5 @@
+use crate::server::IoError;
+
 use super::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
 use alloc::alloc::{Layout, alloc, dealloc};
 use hashbrown::HashMap;
@@ -19,6 +21,7 @@ unsafe impl Send for BytesStorage {}
 unsafe impl Send for BytesResource {}
 
 /// This struct is a pointer to a memory chunk or slice.
+#[derive(Debug, Clone)]
 pub struct BytesResource {
     ptr: *mut u8,
     utilization: StorageUtilization,
@@ -40,10 +43,21 @@ impl BytesResource {
         }
     }
 
+    /// Get the ptr this resource points to.
+    pub fn mut_ptr(&mut self) -> *mut u8 {
+        let (ptr, _) = self.get_exact_location_and_length();
+        ptr
+    }
+
     /// Returns the resource as a mutable slice of bytes.
-    pub fn write<'a>(&self) -> &'a mut [u8] {
+    pub fn write<'a>(&mut self) -> &'a mut [u8] {
         let (ptr, len) = self.get_exact_location_and_length();
 
+        // TODO: This is not safe if there are multiple resources which have a pointer.
+        // SAFETY:
+        // - ptr is constructed to not be null and aligned.
+        // - Total size of the allocation is at least `len`.
+        // - The total len is <= isize::MAX.
         unsafe { core::slice::from_raw_parts_mut(ptr, len) }
     }
 
@@ -51,6 +65,12 @@ impl BytesResource {
     pub fn read<'a>(&self) -> &'a [u8] {
         let (ptr, len) = self.get_exact_location_and_length();
 
+        // TODO: This is not safe if there are multiple resources which have a pointer.
+        //
+        // SAFETY:
+        // - ptr is constructed to not be null and aligned.
+        // - Total size of the allocation is at least `len`.
+        // - The total len is <= isize::MAX.
         unsafe { core::slice::from_raw_parts(ptr, len) }
     }
 }
@@ -71,7 +91,7 @@ impl ComputeStorage for BytesStorage {
         }
     }
 
-    fn alloc(&mut self, size: u64) -> StorageHandle {
+    fn alloc(&mut self, size: u64) -> Result<StorageHandle, IoError> {
         let id = StorageId::new();
         let handle = StorageHandle {
             id,
@@ -81,12 +101,16 @@ impl ComputeStorage for BytesStorage {
         unsafe {
             let layout = Layout::array::<u8>(size as usize).unwrap();
             let ptr = alloc(layout);
+            if ptr.is_null() {
+                // Assume allocation failure is OOM, we can't see the actual error on stable
+                return Err(IoError::BufferTooBig(size as usize));
+            }
             let memory = AllocatedBytes { ptr, layout };
 
             self.memory.insert(id, memory);
         }
 
-        handle
+        Ok(handle)
     }
 
     fn dealloc(&mut self, id: StorageId) {
@@ -105,7 +129,7 @@ mod tests {
     #[test]
     fn test_can_alloc_and_dealloc() {
         let mut storage = BytesStorage::default();
-        let handle_1 = storage.alloc(64);
+        let handle_1 = storage.alloc(64).unwrap();
 
         assert_eq!(handle_1.size(), 64);
         storage.dealloc(handle_1.id);
@@ -114,7 +138,7 @@ mod tests {
     #[test]
     fn test_slices() {
         let mut storage = BytesStorage::default();
-        let handle_1 = storage.alloc(64);
+        let handle_1 = storage.alloc(64).unwrap();
         let handle_2 = StorageHandle::new(
             handle_1.id,
             StorageUtilization {

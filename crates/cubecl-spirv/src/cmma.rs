@@ -4,7 +4,7 @@ use crate::{
     lookups::Matrix,
     variable::Variable,
 };
-use cubecl_core::ir::{self as core, CoopMma, Id, MatrixLayout};
+use cubecl_core::ir::{self as core, CoopMma, ElemType, Id, MatrixLayout};
 use rspirv::spirv::{
     Capability, CooperativeMatrixLayout, CooperativeMatrixOperands, CooperativeMatrixUse,
     StorageClass,
@@ -34,6 +34,12 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                 offset,
             } => self.compile_store(mat, out, stride, offset, layout),
             CoopMma::Cast { input } => self.compile_cast(input, out),
+            CoopMma::RowIndex { .. }
+            | CoopMma::ColIndex { .. }
+            | CoopMma::ExecuteManual { .. }
+            | CoopMma::ExecuteScaled { .. } => {
+                panic!("Manual register management not currently supported in SPIR-V")
+            }
         }
     }
 
@@ -211,7 +217,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             CooperativeMatrixUse::MatrixAKHR => mat.m,
             CooperativeMatrixUse::MatrixBKHR => mat.k,
             CooperativeMatrixUse::MatrixAccumulatorKHR => mat.m,
-        } as u32;
+        };
         self.const_u32(rows)
     }
 
@@ -220,7 +226,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             CooperativeMatrixUse::MatrixAKHR => mat.k,
             CooperativeMatrixUse::MatrixBKHR => mat.n,
             CooperativeMatrixUse::MatrixAccumulatorKHR => mat.n,
-        } as u32;
+        };
         self.const_u32(columns)
     }
 
@@ -234,7 +240,19 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
     }
 
     pub fn init_coop_matrix(&mut self, mat: core::Matrix, var: core::Variable) -> Matrix {
-        let elem = self.compile_item(core::Item::new(mat.elem)).elem();
+        if mat.storage.elem_type() == ElemType::Float(core::FloatKind::BF16) {
+            self.capabilities
+                .insert(Capability::BFloat16CooperativeMatrixKHR);
+        }
+        if matches!(
+            mat.storage.elem_type(),
+            ElemType::Float(core::FloatKind::E5M2 | core::FloatKind::E4M3)
+        ) {
+            self.capabilities
+                .insert(Capability::Float8CooperativeMatrixEXT);
+        }
+
+        let elem = self.compile_type(core::Type::new(mat.storage)).elem();
         let ident = match mat.ident {
             core::MatrixIdent::A => CooperativeMatrixUse::MatrixAKHR,
             core::MatrixIdent::B => CooperativeMatrixUse::MatrixBKHR,

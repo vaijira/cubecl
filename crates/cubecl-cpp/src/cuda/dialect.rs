@@ -1,14 +1,19 @@
-use std::{collections::HashSet, marker::PhantomData};
+use std::{collections::HashSet, fmt::Display, marker::PhantomData};
 
-use cubecl_core::ir::Id;
+use cubecl_core::{ir::Processor, post_processing::saturating::SaturatingArithmeticProcessor};
 
 use crate::{
     Dialect,
-    cuda::ptx::TMA_LOAD_IM2COL,
+    cuda::{
+        extension::{Fragment, MmaExecute, MmaExecuteScaled, MmaExtension},
+        processors::CudaMmaProcessor,
+        ptx::*,
+    },
     shared::{
         self, Binding, Component, DialectBindings, DialectCubeBuiltins, DialectIncludes,
-        DialectInstructions, DialectTypes, DialectWmmaCompiler, Elem, FP4Kind, FP6Kind, FP8Kind,
-        Flags, Instruction, Item, SharedMemory, Variable, WarpInstruction, unary,
+        DialectInstructions, DialectProcessors, DialectTypes, DialectWarpReduceCompiler,
+        DialectWmmaCompiler, Elem, FP4Kind, FP6Kind, FP8Kind, Flags, Instruction, Item, ManualMma,
+        Variable, WarpInstruction, unary,
     },
 };
 
@@ -19,16 +24,12 @@ pub struct CudaDialect<M> {
     _wmma_compiler: PhantomData<M>,
 }
 
-// Base dialect
-
 impl<M: DialectWmmaCompiler<Self>> Dialect for CudaDialect<M> {
     type Architecture = CudaArchitecture;
 }
 
-// Includes
-
 impl<M: DialectWmmaCompiler<Self>> DialectIncludes<Self> for CudaDialect<M> {
-    type Extension = Extension;
+    type Extension = Extension<Self>;
 
     fn compile_includes(f: &mut std::fmt::Formatter<'_>, flags: &Flags) -> std::fmt::Result {
         f.write_str("#include <cuda_runtime.h>\n")?;
@@ -47,9 +48,12 @@ impl<M: DialectWmmaCompiler<Self>> DialectIncludes<Self> for CudaDialect<M> {
         if flags.elem_f16 {
             f.write_str("#include <cuda_fp16.h>\n")?;
         }
-        if flags.inst_wmma {
-            Self::compile_wmma_includes(f)?;
+
+        // tf32 conversion function is in mma header
+        if flags.inst_wmma || flags.elem_tf32 {
+            Self::compile_wmma_includes(f, flags)?;
         }
+
         if flags.op_pipeline {
             f.write_str("#include <cooperative_groups/memcpy_async.h>\n")?;
             f.write_str("#include <cuda/pipeline>\n")?;
@@ -70,9 +74,15 @@ alignas(64) unsigned long long int opaque[16];
     }
 
     fn compile_extensions(
-        _f: &mut std::fmt::Formatter<'_>,
-        _extensions: &[Self::Extension],
+        f: &mut std::fmt::Formatter<'_>,
+        extensions: &[Self::Extension],
     ) -> std::fmt::Result {
+        for extension in extensions {
+            match extension {
+                Extension::NoExtension => {}
+                Extension::Mma(mma) => mma.format_extension(f)?,
+            }
+        }
         Ok(())
     }
 
@@ -87,6 +97,61 @@ alignas(64) unsigned long long int opaque[16];
         _instruction: &WarpInstruction<Self>,
     ) {
     }
+
+    fn register_wmma_instruction_extension(
+        extensions: &mut Vec<Self::Extension>,
+        instruction: &shared::WmmaInstruction<Self>,
+    ) {
+        match instruction {
+            shared::WmmaInstruction::ExecuteManual {
+                shape,
+                frag_a,
+                frag_b,
+                frag_c,
+                frag_d,
+            } => {
+                let ext = Extension::Mma(MmaExtension::Execute(MmaExecute::new(
+                    *shape,
+                    vars_to_frag(frag_a),
+                    vars_to_frag(frag_b),
+                    vars_to_frag(frag_c),
+                    Fragment(frag_d.elem()),
+                )));
+                if !extensions.contains(&ext) {
+                    extensions.push(ext);
+                }
+            }
+            shared::WmmaInstruction::ExecuteScaled {
+                shape,
+                frag_a,
+                frag_b,
+                frag_c,
+                frag_d,
+                scales_a,
+                scales_factor,
+                ..
+            } => {
+                let ext = Extension::Mma(MmaExtension::ExecuteScaled(MmaExecuteScaled::new(
+                    *shape,
+                    vars_to_frag(frag_a),
+                    vars_to_frag(frag_b),
+                    vars_to_frag(frag_c),
+                    Fragment(frag_d.elem()),
+                    scales_a.elem(),
+                    *scales_factor,
+                )));
+                if !extensions.contains(&ext) {
+                    extensions.push(ext);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn vars_to_frag<D: Dialect>(vars: &[Variable<D>]) -> Fragment<D> {
+    let elem = vars[0].elem();
+    Fragment(elem)
 }
 
 // Types
@@ -133,11 +198,16 @@ impl<M: DialectWmmaCompiler<Self>> DialectTypes<Self> for CudaDialect<M> {
 
         shared::type_definitions::<Self>(f)?;
         shared::type_vectorized_definitions::<Self>(f, &items_deduplicated)?;
+
         if flags.use_grid_constants {
             shared::type_scalar_definitions::<Self>(f, scalars)?;
             shared::type_info_definition::<Self>(f, flags.static_meta_length)?;
         }
-        Self::compile_wmma_type_definitions(f)?;
+
+        if flags.inst_wmma {
+            Self::compile_wmma_type_definitions(f, flags)?;
+        }
+
         Ok(())
     }
 
@@ -214,22 +284,6 @@ impl<M: DialectWmmaCompiler<Self>> DialectTypes<Self> for CudaDialect<M> {
     fn compile_local_memory_qualifier(_f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
     }
-
-    fn compile_shared_memory_declaration(
-        f: &mut std::fmt::Formatter<'_>,
-        shared: &SharedMemory<Self>,
-    ) -> std::fmt::Result {
-        let item = shared.item;
-        let index = shared.index;
-        let offset = shared.offset;
-        let size = shared.size;
-        let size_bytes = size * shared.item.size() as u32;
-        writeln!(f, "// Shared memory size: {size}, {size_bytes} bytes")?;
-        writeln!(
-            f,
-            "{item} *shared_memory_{index} = reinterpret_cast<{item}*>(&dynamic_shared_mem[{offset}]);"
-        )
-    }
 }
 
 // Kernel argument bindings
@@ -238,7 +292,7 @@ impl<M: DialectWmmaCompiler<Self>> DialectBindings<Self> for CudaDialect<M> {
     fn compile_kernel_signature(
         f: &mut std::fmt::Formatter<'_>,
         kernel_name: &str,
-        tensor_maps: &[Id],
+        tensor_maps: &[Binding<Self>],
         buffers: &[Binding<Self>],
         scalars: &[(Elem<Self>, usize)],
         flags: &Flags,
@@ -247,7 +301,8 @@ impl<M: DialectWmmaCompiler<Self>> DialectBindings<Self> for CudaDialect<M> {
             f,
             "
 
-extern \"C\" __global__ void "
+extern \"C\" __global__ void __launch_bounds__({})",
+            flags.cube_dim.num_elems()
         )?;
         if let Some(cluster_dim) = flags.cluster_dim {
             write!(
@@ -278,7 +333,7 @@ extern \"C\" __global__ void "
             let max_align = body
                 .shared_memories
                 .iter()
-                .map(|smem| smem.align.unwrap_or(smem.item.size() as u32))
+                .map(|smem| smem.align)
                 .max()
                 .unwrap();
             // The `__align__` instead of `alignas` is on purpose - the compiler is currently bugged
@@ -291,6 +346,8 @@ extern \"C\" __global__ void "
         Ok(())
     }
 }
+
+impl<M: DialectWmmaCompiler<Self>> DialectWarpReduceCompiler<Self> for CudaDialect<M> {}
 
 // Cube builtins dialect
 
@@ -364,6 +421,55 @@ impl<M: DialectWmmaCompiler<Self>> DialectInstructions<Self> for CudaDialect<M> 
             ),
         }?;
         write!(f, ")")
+    }
+
+    fn compile_saturating_add(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: impl Display,
+        rhs: impl Display,
+        item: Item<Self>,
+    ) -> std::fmt::Result {
+        let elem = item.elem();
+        match elem {
+            Elem::I32 => {
+                write!(
+                    f,
+                    r#"[&]() -> {elem} {{
+    {elem} result;
+    asm("add.sat.s32 %0, %1, %2;"
+        : "=r"(result)
+        : "r"({lhs}), "r"({rhs}));
+    return result;
+        }}()"#
+                )
+            }
+            _ => unreachable!("Should be replaced by polyfill"),
+        }
+    }
+
+    fn compile_saturating_sub(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: impl Display,
+        rhs: impl Display,
+        item: Item<Self>,
+    ) -> std::fmt::Result {
+        let elem = item.elem();
+        // Native instruction only exists for signed int, unsigned should be removed in a preprocessor
+        match elem {
+            Elem::I32 => {
+                write!(
+                    f,
+                    r#"[&]() -> {elem} {{
+    {elem} result;
+    asm("sub.sat.s32 %0, %1, %2;"
+        : "=r"(result)
+        : "r"({lhs}), "r"({rhs}));
+    return result;
+        }}()"#
+                )
+            }
+            _ => unreachable!("Should be replaced by polyfill"),
+        }
     }
 
     // others
@@ -446,12 +552,15 @@ impl<M: DialectWmmaCompiler<Self>> DialectInstructions<Self> for CudaDialect<M> 
 // Coop Matrices dialect
 
 impl<M: DialectWmmaCompiler<Self>> DialectWmmaCompiler<Self> for CudaDialect<M> {
-    fn compile_wmma_includes(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        M::compile_wmma_includes(f)
+    fn compile_wmma_includes(f: &mut std::fmt::Formatter<'_>, flags: &Flags) -> std::fmt::Result {
+        M::compile_wmma_includes(f, flags)
     }
 
-    fn compile_wmma_type_definitions(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        M::compile_wmma_type_definitions(f)
+    fn compile_wmma_type_definitions(
+        f: &mut std::fmt::Formatter<'_>,
+        flags: &Flags,
+    ) -> std::fmt::Result {
+        M::compile_wmma_type_definitions(f, flags)
     }
 
     fn compile_wmma_local_variables(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -493,9 +602,45 @@ impl<M: DialectWmmaCompiler<Self>> DialectWmmaCompiler<Self> for CudaDialect<M> 
         M::compile_wmma_instruction(f, instruction)
     }
 
+    fn compile_manual_mma(
+        f: &mut std::fmt::Formatter<'_>,
+        mma: ManualMma<Self>,
+    ) -> std::fmt::Result {
+        M::compile_manual_mma(f, mma)
+    }
+
+    fn compile_scaled_mma(
+        f: &mut std::fmt::Formatter<'_>,
+        mma: ManualMma<Self>,
+        scales_a: Variable<Self>,
+        scales_b: Variable<Self>,
+        scales_factor: u32,
+    ) -> std::fmt::Result {
+        M::compile_scaled_mma(f, mma, scales_a, scales_b, scales_factor)
+    }
+
     fn supported_wmma_combinations(
         arch: &CudaArchitecture,
-    ) -> crate::shared::SupportedWmmaCombinations {
+    ) -> crate::shared::SupportedMmaCombinations {
         M::supported_wmma_combinations(arch)
+    }
+
+    fn supported_mma_combinations(arch: &CudaArchitecture) -> shared::SupportedMmaCombinations {
+        M::supported_mma_combinations(arch)
+    }
+
+    fn supported_scaled_mma_combinations(
+        arch: &CudaArchitecture,
+    ) -> shared::SupportedScaledMmaCombinations {
+        M::supported_scaled_mma_combinations(arch)
+    }
+}
+
+impl<M: DialectWmmaCompiler<Self>> DialectProcessors<Self> for CudaDialect<M> {
+    fn processors() -> Vec<Box<dyn Processor>> {
+        vec![
+            Box::new(CudaMmaProcessor),
+            Box::new(SaturatingArithmeticProcessor::new(false)),
+        ]
     }
 }

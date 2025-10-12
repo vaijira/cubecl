@@ -2,7 +2,7 @@ use crate::{
     kernel::KernelMetadata,
     logging::ServerLogger,
     memory_management::{
-        MemoryHandle, MemoryUsage,
+        MemoryAllocationMode, MemoryHandle, MemoryUsage,
         memory_pool::{SliceBinding, SliceHandle},
     },
     storage::{BindingResource, ComputeStorage},
@@ -11,10 +11,14 @@ use crate::{
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Debug;
-use cubecl_common::{ExecutionMode, future::DynFut, profile::ProfileDuration};
-use cubecl_ir::Elem;
+use cubecl_common::{
+    ExecutionMode, bytes::Bytes, future::DynFut, profile::ProfileDuration, stream_id::StreamId,
+};
+use cubecl_ir::StorageType;
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 /// An error during profiling.
@@ -29,7 +33,7 @@ pub enum ProfileError {
 ///
 /// Everything in the server is mutable, therefore it should be solely accessed through the
 /// [compute channel](crate::channel::ComputeChannel) for thread safety.
-pub trait ComputeServer: Send + core::fmt::Debug
+pub trait ComputeServer: Send + core::fmt::Debug + ServerCommunication
 where
     Self: Sized,
 {
@@ -39,48 +43,67 @@ where
     type Info: Debug + Send + Sync;
     /// The [storage](ComputeStorage) type defines how data is stored and accessed.
     type Storage: ComputeStorage;
-    /// The type of the features supported by the server.
-    type Feature: Ord + Copy + Debug + Send + Sync;
+
+    /// Reserves `size` bytes in the storage, and returns a handle over them.
+    fn create(
+        &mut self,
+        descriptors: Vec<AllocationDescriptor<'_>>,
+        stream_id: StreamId,
+    ) -> Result<Vec<Allocation>, IoError>;
+
+    /// Retrieve the server logger.
+    fn logger(&self) -> Arc<ServerLogger>;
+
+    /// Utility to create a new buffer and immediately copy contiguous data into it
+    fn create_with_data(&mut self, data: &[u8], stream_id: StreamId) -> Result<Handle, IoError> {
+        let alloc = self
+            .create(
+                vec![AllocationDescriptor::new(
+                    AllocationKind::Contiguous,
+                    &[data.len()],
+                    1,
+                )],
+                stream_id,
+            )?
+            .remove(0);
+        self.write(
+            vec![(
+                CopyDescriptor::new(
+                    alloc.handle.clone().binding(),
+                    &[data.len()],
+                    &alloc.strides,
+                    1,
+                ),
+                data,
+            )],
+            stream_id,
+        )?;
+        Ok(alloc.handle)
+    }
 
     /// Given bindings, returns the owned resources as bytes.
-    fn read(&mut self, bindings: Vec<Binding>) -> DynFut<Vec<Vec<u8>>>;
+    fn read<'a>(
+        &mut self,
+        descriptors: Vec<CopyDescriptor<'a>>,
+        stream_id: StreamId,
+    ) -> DynFut<Result<Vec<Bytes>, IoError>>;
 
-    /// Given tensor handles, returns the owned resources as bytes.
-    fn read_tensor(&mut self, bindings: Vec<BindingWithMeta>) -> DynFut<Vec<Vec<u8>>>;
+    /// Writes the specified bytes into the buffers given
+    fn write(
+        &mut self,
+        descriptors: Vec<(CopyDescriptor<'_>, &[u8])>,
+        stream_id: StreamId,
+    ) -> Result<(), IoError>;
 
     /// Wait for the completion of every task in the server.
-    fn sync(&mut self) -> DynFut<()>;
+    fn sync(&mut self, stream_id: StreamId) -> DynFut<()>;
 
     /// Given a resource handle, returns the storage resource.
     fn get_resource(
         &mut self,
         binding: Binding,
+        stream_id: StreamId,
     ) -> BindingResource<<Self::Storage as ComputeStorage>::Resource>;
-
-    /// Given a resource as bytes, stores it and returns the memory handle.
-    fn create(&mut self, data: &[u8]) -> Handle;
-
-    /// Given a resource as bytes with `shape`, stores it and returns the tensor handle.
-    /// May or may not be contiguous, depending on what's best for the given runtime. Always use
-    /// strides to index.
-    /// For example, in CUDA, this will allocate a padded tensor where the last dimension is padded
-    /// to the cache lines, so row access is faster.
-    fn create_tensors(
-        &mut self,
-        data: Vec<&[u8]>,
-        shapes: Vec<&[usize]>,
-        elem_sizes: Vec<usize>,
-    ) -> Vec<(Handle, Vec<usize>)>;
-
-    /// Reserves `size` bytes in the storage, and returns a handle over them.
-    fn empty(&mut self, size: usize) -> Handle;
-
-    /// Reserves `shape` bytes in the storage, and returns a handle to it.
-    fn empty_tensors(
-        &mut self,
-        shapes: Vec<&[usize]>,
-        elem_sizes: Vec<usize>,
-    ) -> Vec<(Handle, Vec<usize>)>;
 
     /// Executes the `kernel` over the given memory `handles`.
     ///
@@ -96,23 +119,72 @@ where
         count: CubeCount,
         bindings: Bindings,
         kind: ExecutionMode,
-        logger: Arc<ServerLogger>,
+        stream_id: StreamId,
     );
 
     /// Flush all outstanding tasks in the server.
-    fn flush(&mut self);
+    fn flush(&mut self, stream_id: StreamId);
 
     /// The current memory usage of the server.
-    fn memory_usage(&self) -> MemoryUsage;
+    fn memory_usage(&mut self, stream_id: StreamId) -> MemoryUsage;
 
     /// Ask the server to release memory that it can release.
-    fn memory_cleanup(&mut self);
+    fn memory_cleanup(&mut self, stream_id: StreamId);
 
     /// Enable collecting timestamps.
-    fn start_profile(&mut self) -> ProfilingToken;
+    fn start_profile(&mut self, stream_id: StreamId) -> ProfilingToken;
 
     /// Disable collecting timestamps.
-    fn end_profile(&mut self, token: ProfilingToken) -> Result<ProfileDuration, ProfileError>;
+    fn end_profile(
+        &mut self,
+        stream_id: StreamId,
+        token: ProfilingToken,
+    ) -> Result<ProfileDuration, ProfileError>;
+
+    /// Update the memory mode of allocation in the server.
+    fn allocation_mode(&mut self, mode: MemoryAllocationMode, stream_id: StreamId);
+}
+
+/// Defines functions for optimized data transfer between servers, supporting custom communication
+/// mechanisms such as peer-to-peer communication or specialized implementations.
+pub trait ServerCommunication {
+    /// Indicates whether server-to-server communication is enabled for this implementation.
+    const SERVER_COMM_ENABLED: bool;
+
+    /// Copies data from a source server to a destination server.
+    ///
+    /// # Arguments
+    ///
+    /// * `server_src` - A mutable reference to the source server from which data is copied.
+    /// * `server_dst` - A mutable reference to the destination server receiving the data.
+    /// * `src` - A descriptor specifying the data to be copied, including shape, strides, and binding.
+    /// * `stream_id_src` - The stream ID associated with the source server's operation.
+    /// * `stream_id_dst` - The stream ID associated with the destination server's operation.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing an `Allocation` on success, or an `IoError` if the operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if server communication is not enabled (`SERVER_COMM_ENABLED` is `false`) or if the
+    /// trait is incorrectly implemented by the server.
+    #[allow(unused_variables)]
+    fn copy(
+        server_src: &mut Self,
+        server_dst: &mut Self,
+        src: CopyDescriptor<'_>,
+        stream_id_src: StreamId,
+        stream_id_dst: StreamId,
+    ) -> Result<Allocation, IoError> {
+        if !Self::SERVER_COMM_ENABLED {
+            panic!("Server-to-server communication is not supported by this server.");
+        } else {
+            panic!(
+                "[Internal Error] The `ServerCommunication` trait is incorrectly implemented by the server."
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -123,7 +195,7 @@ pub struct ProfilingToken {
 }
 
 /// Server handle containing the [memory handle](crate::server::Handle).
-#[derive(new, Debug)]
+#[derive(new, Debug, PartialEq, Eq)]
 pub struct Handle {
     /// Memory handle.
     pub memory: SliceHandle,
@@ -131,8 +203,72 @@ pub struct Handle {
     pub offset_start: Option<u64>,
     /// Memory offset in bytes.
     pub offset_end: Option<u64>,
+    /// The stream where the data was created.
+    pub stream: cubecl_common::stream_id::StreamId,
+    /// The stream position when the tensor became available.
+    pub cursor: u64,
     /// Length of the underlying buffer ignoring offsets
     size: u64,
+}
+
+/// Type of allocation, either contiguous or optimized (row-aligned when possible)
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum AllocationKind {
+    /// Contiguous layout, with no padding
+    Contiguous,
+    /// Optimized for access speed. In practice this means row-aligned with padding for runtimes
+    /// that support it.
+    Optimized,
+}
+
+/// Descriptor for a new tensor allocation
+#[derive(new, Debug, Clone, Copy)]
+pub struct AllocationDescriptor<'a> {
+    /// Layout for the tensor
+    pub kind: AllocationKind,
+    /// Shape of the tensor
+    pub shape: &'a [usize],
+    /// Size of each element in the tensor (used for conversion of shape to bytes)
+    pub elem_size: usize,
+}
+
+impl<'a> AllocationDescriptor<'a> {
+    /// Create an optimized allocation descriptor
+    pub fn optimized(shape: &'a [usize], elem_size: usize) -> Self {
+        AllocationDescriptor::new(AllocationKind::Optimized, shape, elem_size)
+    }
+
+    /// Create a contiguous allocation descriptor
+    pub fn contiguous(shape: &'a [usize], elem_size: usize) -> Self {
+        AllocationDescriptor::new(AllocationKind::Contiguous, shape, elem_size)
+    }
+}
+
+/// An allocation with associated strides. Strides depend on tensor layout.
+#[derive(new, Debug)]
+pub struct Allocation {
+    /// The handle for the memory resource
+    pub handle: Handle,
+    /// The strides of the tensor
+    pub strides: Vec<usize>,
+}
+
+/// Error returned from `create`/`read`/`write` functions. Due to async execution not all errors
+/// are able to be caught, so some IO errors will still panic.
+#[derive(Debug, Error)]
+pub enum IoError {
+    /// Buffer size exceeds the max available
+    #[error("can't allocate buffer of size")]
+    BufferTooBig(usize),
+    /// Strides aren't supported for this copy operation on this runtime
+    #[error("the provided strides are not supported for this operation")]
+    UnsupportedStrides,
+    /// Handle wasn't found in the memory pool
+    #[error("couldn't find resource for that handle")]
+    InvalidHandle,
+    /// Unknown error happened during execution
+    #[error("Unknown error happened during execution")]
+    Unknown(String),
 }
 
 impl Handle {
@@ -172,7 +308,7 @@ pub struct Bindings {
     /// Ordered by inputs, then outputs, then tensormaps
     pub metadata: MetadataBinding,
     /// Scalar bindings
-    pub scalars: BTreeMap<Elem, ScalarBinding>,
+    pub scalars: BTreeMap<StorageType, ScalarBinding>,
     /// Tensor map bindings
     pub tensor_maps: Vec<TensorMapBinding>,
 }
@@ -196,16 +332,16 @@ impl Bindings {
     }
 
     /// Add a scalar parameter
-    pub fn with_scalar(mut self, elem: Elem, length: usize, data: Vec<u64>) -> Self {
+    pub fn with_scalar(mut self, ty: StorageType, length: usize, data: Vec<u64>) -> Self {
         self.scalars
-            .insert(elem, ScalarBinding::new(elem, length, data));
+            .insert(ty, ScalarBinding::new(ty, length, data));
         self
     }
 
     /// Extend the scalars with `bindings`
     pub fn with_scalars(mut self, bindings: Vec<ScalarBinding>) -> Self {
         self.scalars
-            .extend(bindings.into_iter().map(|binding| (binding.elem, binding)));
+            .extend(bindings.into_iter().map(|binding| (binding.ty, binding)));
         self
     }
 
@@ -232,10 +368,10 @@ pub struct MetadataBinding {
 }
 
 /// Binding of a set of scalars of the same type to execute a kernel.
-#[derive(new, Debug)]
+#[derive(new, Debug, Clone)]
 pub struct ScalarBinding {
     /// Type of the scalars
-    pub elem: Elem,
+    pub ty: StorageType,
     /// Unpadded length of the underlying data
     pub length: usize,
     /// Type-erased data of the scalars. Padded and represented by u64 to prevent misalignment.
@@ -258,17 +394,30 @@ pub struct Binding {
     pub offset_start: Option<u64>,
     /// Memory offset in bytes.
     pub offset_end: Option<u64>,
+    /// The stream where the data was created.
+    pub stream: cubecl_common::stream_id::StreamId,
+    /// The stream position when the tensor became available.
+    pub cursor: u64,
+    /// Size in bytes
+    size: u64,
+}
+
+impl Binding {
+    /// Get the size of the handle, in bytes, accounting for offsets
+    pub fn size(&self) -> u64 {
+        self.size - self.offset_start.unwrap_or(0) - self.offset_end.unwrap_or(0)
+    }
 }
 
 /// A binding with shape and stride info for non-contiguous reading
-#[derive(new, Debug)]
-pub struct BindingWithMeta {
+#[derive(new, Debug, Clone)]
+pub struct CopyDescriptor<'a> {
     /// Binding for the memory resource
     pub binding: Binding,
     /// Shape of the resource
-    pub shape: Vec<usize>,
+    pub shape: &'a [usize],
     /// Strides of the resource
-    pub strides: Vec<usize>,
+    pub strides: &'a [usize],
     /// Size of each element in the resource
     pub elem_size: usize,
 }
@@ -304,14 +453,14 @@ pub struct TensorMapMeta {
     pub prefetch: TensorMapPrefetch,
     /// OOB fill value
     pub oob_fill: OobFill,
-    /// Element type
-    pub elem: Elem,
+    /// Storage type
+    pub storage_ty: StorageType,
 }
 
 impl Handle {
     /// If the tensor handle can be reused inplace.
     pub fn can_mut(&self) -> bool {
-        self.memory.can_mut()
+        self.memory.can_mut() && self.stream == StreamId::current()
     }
 }
 
@@ -322,21 +471,24 @@ impl Handle {
             memory: MemoryHandle::binding(self.memory),
             offset_start: self.offset_start,
             offset_end: self.offset_end,
+            size: self.size,
+            stream: self.stream,
+            cursor: self.cursor,
         }
     }
 
     /// Convert the [handle](Handle) into a [binding](Binding) with shape and stride metadata.
-    pub fn binding_with_meta(
-        self,
-        shape: Vec<usize>,
-        strides: Vec<usize>,
+    pub fn copy_descriptor<'a>(
+        &'a self,
+        shape: &'a [usize],
+        strides: &'a [usize],
         elem_size: usize,
-    ) -> BindingWithMeta {
-        BindingWithMeta {
+    ) -> CopyDescriptor<'a> {
+        CopyDescriptor {
             shape,
             strides,
             elem_size,
-            binding: self.binding(),
+            binding: self.clone().binding(),
         }
     }
 }
@@ -348,6 +500,8 @@ impl Clone for Handle {
             offset_start: self.offset_start,
             offset_end: self.offset_end,
             size: self.size,
+            stream: self.stream,
+            cursor: self.cursor,
         }
     }
 }
@@ -358,6 +512,9 @@ impl Clone for Binding {
             memory: self.memory.clone(),
             offset_start: self.offset_start,
             offset_end: self.offset_end,
+            size: self.size,
+            stream: self.stream,
+            cursor: self.cursor,
         }
     }
 }

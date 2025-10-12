@@ -182,6 +182,13 @@ impl<T: CubeType> IntoIterator for SequenceExpand<T> {
     }
 }
 
+impl<T: CubeType> SequenceExpand<T> {
+    /// Provides an iterator without modifying the sequence
+    pub fn iter_cloned(&self) -> impl Iterator<Item = T::ExpandType> {
+        self.values.borrow().clone().into_iter()
+    }
+}
+
 impl<T: CubeType> CubeType for Sequence<T> {
     type ExpandType = SequenceExpand<T>;
 }
@@ -253,5 +260,9 @@ impl<T: CubeType> SequenceExpand<T> {
     pub fn __expand_rev_method(self, _scope: &mut Scope) -> Self {
         self.values.borrow_mut().reverse();
         self
+    }
+
+    pub fn __expand_clone_method(&self, _scope: &mut Scope) -> Self {
+        self.clone()
     }
 }

@@ -3,7 +3,7 @@ use std::{
     mem::take,
 };
 
-use cubecl_ir::{Id, Instruction, Item, Variable, VariableKind};
+use cubecl_ir::{Id, Instruction, Type, Variable, VariableKind};
 use petgraph::visit::EdgeRef;
 
 use crate::{ControlFlow, EdgeIndex, NodeIndex};
@@ -122,11 +122,11 @@ impl Optimizer {
                 .iter_mut()
                 .find(|it| it.block == source)
                 .unwrap();
-            if let Some((id, item, _)) = as_versioned(entry.value) {
-                if self.program.variables.contains_key(&id) {
-                    let version = state.versions[&id];
-                    entry.value = Variable::new(VariableKind::Versioned { id, version }, item);
-                }
+            if let Some((id, item, _)) = as_versioned(entry.value)
+                && self.program.variables.contains_key(&id)
+            {
+                let version = state.versions[&id];
+                entry.value = Variable::new(VariableKind::Versioned { id, version }, item);
             }
         }
     }
@@ -134,20 +134,20 @@ impl Optimizer {
     /// Version the operations for this block
     fn version_block_ops(&mut self, block: NodeIndex, state: &mut SsaState<'_>) {
         for phi in self.program[block].phi_nodes.borrow_mut().iter_mut() {
-            if let Some((id, item, _)) = as_versioned(phi.out) {
-                if self.program.variables.contains_key(&id) {
-                    let version = state.versions.get_mut(&id).unwrap();
-                    let max_version = state.max_versions.get_mut(&id).unwrap();
-                    *max_version += 1;
-                    *version = *max_version;
-                    phi.out = Variable::new(
-                        VariableKind::Versioned {
-                            id,
-                            version: *version,
-                        },
-                        item,
-                    );
-                }
+            if let Some((id, item, _)) = as_versioned(phi.out)
+                && self.program.variables.contains_key(&id)
+            {
+                let version = state.versions.get_mut(&id).unwrap();
+                let max_version = state.max_versions.get_mut(&id).unwrap();
+                *max_version += 1;
+                *version = *max_version;
+                phi.out = Variable::new(
+                    VariableKind::Versioned {
+                        id,
+                        version: *version,
+                    },
+                    item,
+                );
             }
         }
 
@@ -185,7 +185,7 @@ impl Optimizer {
                             id,
                             version: *version,
                         },
-                        var.item,
+                        var.ty,
                     )
                 }
             }
@@ -196,16 +196,16 @@ impl Optimizer {
     fn version_read(&self, var: &mut Variable, state: &mut SsaState<'_>) {
         match var.kind {
             VariableKind::LocalMut { id } | VariableKind::Versioned { id, .. } => {
-                if self.program.variables.contains_key(&id) {
-                    if let Some(version) = state.versions.get(&id) {
-                        *var = Variable::new(
-                            VariableKind::Versioned {
-                                id,
-                                version: *version,
-                            },
-                            var.item,
-                        )
-                    }
+                if self.program.variables.contains_key(&id)
+                    && let Some(version) = state.versions.get(&id)
+                {
+                    *var = Variable::new(
+                        VariableKind::Versioned {
+                            id,
+                            version: *version,
+                        },
+                        var.ty,
+                    )
                 }
             }
             _ => {}
@@ -213,9 +213,9 @@ impl Optimizer {
     }
 }
 
-fn as_versioned(var: Variable) -> Option<(Id, Item, u16)> {
+fn as_versioned(var: Variable) -> Option<(Id, Type, u16)> {
     match var.kind {
-        VariableKind::Versioned { id, version } => Some((id, var.item, version)),
+        VariableKind::Versioned { id, version } => Some((id, var.ty, version)),
         _ => None,
     }
 }

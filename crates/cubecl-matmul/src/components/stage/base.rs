@@ -1,16 +1,22 @@
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
-use cubecl_std::tensor::r#virtual::{ReadWrite, VirtualTensor};
+use cubecl_std::{CubeOption, CubeOptionExpand, tensor::layout::Coords2d};
 
-use crate::components::error::MatmulSetupError;
-use crate::components::global::MaxLoaderPlanes;
-use crate::components::stage::NumStages;
-use crate::components::tile::Tile;
-use crate::components::{AvailableLineSizes, MatmulLineSizes, MatmulSelection};
+use crate::components::{AccS, global::MaxGlobalReaderPlanes};
 use crate::components::{
-    Ident, InputIdent, MatmulPrecision, MatmulProblem, MatrixLayout, TilingScheme,
-    global::{self, AccumulatorLoader, GlobalWriter, PlaneRoleConfig, RoleRuleConfig},
+    AvailableLineSizes, LhsS, MatmulLineSizes, MatmulSelection, RhsS, StageIdent,
+};
+use crate::components::{
+    MatmulPrecision, MatmulProblem, MatrixLayout, TilingScheme,
+    global::{self, PlaneRoleConfig, RoleRuleConfig},
     tile::TileConfig,
+};
+use crate::components::{
+    error::MatmulSetupError, global::WriteEventListener, stage::StageMemoryConfig,
+};
+use crate::components::{
+    stage::{NumStages, PartitionScheduler, PartitionSchedulerScheme},
+    tile::io::TileKind,
 };
 use std::{fmt::Debug, hash::Hash};
 
@@ -19,17 +25,23 @@ use super::{StageEventListener, TilingLayout};
 /// A family of [StageMatmul] implementations that operate with any [precision](MatmulPrecision).
 pub trait StageMatmulFamily: Send + Sync + 'static {
     /// The specific [TileMatmul] implementation associated with this family.
-    type Matmul<MP: MatmulPrecision, TL: TilingLayout, TR: TilingLayout>: StageMatmul<
+    type Matmul<MP: MatmulPrecision, TL: TilingLayout, TR: TilingLayout, TA: TilingLayout, TO: TilingLayout>: StageMatmul<
             MP,
             Config = Self::Config,
-            LhsReader = <Self::LhsReader as ReaderFamily>::Reader<MP::ES, TL>,
-            RhsReader = <Self::RhsReader as ReaderFamily>::Reader<MP::ES, TR>,
+            LhsStage = <Self::LhsStage as StageFamily>::Stage<LhsS<MP>, TL>,
+            RhsStage = <Self::RhsStage as StageFamily>::Stage<RhsS<MP>, TR>,
+            AccStage = <Self::AccStage as StageFamily>::Stage<AccS<MP>, TA>,
+            OutStage = <Self::OutStage as StageFamily<ReadWrite>>::Stage<AccS<MP>, TO>,
         >;
 
-    /// Reader family for Lhs
-    type LhsReader: ReaderFamily;
-    /// Reader family for Rhs
-    type RhsReader: ReaderFamily;
+    /// Stage family for Lhs
+    type LhsStage: StageFamily;
+    /// Stage family for Rhs
+    type RhsStage: StageFamily;
+    /// Stage family for Acc
+    type AccStage: StageFamily;
+    /// Stage family for Out
+    type OutStage: StageFamily<ReadWrite>;
 
     /// The configuration type associated with this matmul family.
     type Config: StageConfig;
@@ -44,7 +56,7 @@ pub trait StageMatmulFamily: Send + Sync + 'static {
         selection: &MatmulSelection,
         line_sizes: &MatmulLineSizes,
         num_stages: NumStages,
-        max_loaders: Option<MaxLoaderPlanes>,
+        max_global_readers: Option<MaxGlobalReaderPlanes>,
         ordered: bool,
     ) -> Result<Self::Config, MatmulSetupError>;
 
@@ -77,82 +89,72 @@ pub trait StageMatmul<MP: MatmulPrecision>: 'static + Send + Sync {
 
     /// Contains the matrix multiplication output, that can be shared across the different planes of the cube.
     /// The same Accumulator will be added to across multiple executions of the Stage Matmul.
-    type Accumulator: CubeType;
+    type Accumulators: CubeType;
 
-    /// How to read shared memory for Lhs
-    type LhsReader: CubeType;
-    /// How to read shared memory for Rhs
-    type RhsReader: CubeType;
+    /// Stage for Lhs
+    type LhsStage: CubeType;
+    /// Stage for Rhs
+    type RhsStage: CubeType;
+    /// Stage for Accumulator
+    type AccStage: CubeType;
+    /// Stage for Out
+    type OutStage: CubeType;
 
     /// Lhs input of the underlying Tile Matmul
     type LhsTile: CubeType;
     /// Rhs input of the underlying Tile Matmul
     type RhsTile: CubeType;
 
-    /// How to write to global memory after computation
-    type Writer: GlobalWriter<MP::EO>;
-
     /// Executes the matrix multiplication of Lhs and Rhs, adding the result to the accumulator
     ///
     /// Equivalent to execute_with_listener with SEL:=NoEvent
     fn execute(
-        lhs: &Self::LhsReader,
-        rhs: &Self::RhsReader,
+        lhs: &Self::LhsStage,
+        rhs: &Self::RhsStage,
         instruction_lhs: &mut Self::LhsTile,
         instruction_rhs: &mut Self::RhsTile,
-        acc: &mut Self::Accumulator,
+        acc: &mut Self::Accumulators,
         #[comptime] config: Self::Config,
+        partition_scheduler: &PartitionScheduler,
     );
 
     /// Executes the matrix multiplication of Lhs and Rhs, with the addition of injected
     /// [event listener](StageEventListener).
     fn execute_with_listener<SEL: StageEventListener<Self::Config>>(
-        lhs: &Self::LhsReader,
-        rhs: &Self::RhsReader,
+        lhs: &Self::LhsStage,
+        rhs: &Self::RhsStage,
         instruction_lhs: &mut Self::LhsTile,
         instruction_rhs: &mut Self::RhsTile,
-        acc: &mut Self::Accumulator,
+        acc: &mut Self::Accumulators,
         #[comptime] config: Self::Config,
         listener: SEL,
+        partition_scheduler: &PartitionScheduler,
     );
 
     /// Inits inputs of the underlying Tile Matmul
     fn init_tile_inputs(#[comptime] config: Self::Config) -> (Self::LhsTile, Self::RhsTile);
 
-    /// Create an instance of the accumulator, without data
-    fn init_accumulator(#[comptime] config: Self::Config) -> Self::Accumulator;
+    /// Create an instance of the accumulators, without data
+    fn init_accumulators(#[comptime] config: Self::Config) -> Self::Accumulators;
 
-    /// Fill the accumulator with zeros
-    fn zero_accumulator(acc: &mut Self::Accumulator, #[comptime] config: Self::Config);
-
-    /// Fill the accumulator with data
-    fn fill_accumulator<L: AccumulatorLoader<MP>>(
-        loader: &mut L,
-        acc: &mut Self::Accumulator,
+    /// Load all accumulators in the stage from data
+    fn load_accumulators(
+        reader: &Self::AccStage,
+        acc: &mut Self::Accumulators,
         #[comptime] config: Self::Config,
     );
 
-    /// Inits the writer at the given offsets
-    fn init_writer(
-        tensor: VirtualTensor<MP::EO, ReadWrite>,
-        x_offset: u32,
-        y_offset: u32,
-        batch_offset: u32,
-    ) -> Self::Writer;
-
     /// Reads the result of the accumulator and hands it to the stage writer
-    ///
-    /// # Quantization
-    ///
-    /// If some `quantization` is provided, the read will also requantize the stage in the output
-    /// and update the scaling of the output tensor. This assumes that [execute] is called
-    /// with some `scaling` provided.
-    fn write_results<G: global::GlobalConfig>(
-        acc: &Self::Accumulator,
-        out: &mut Self::Writer,
+    fn write_results<W: WriteEventListener, G: global::GlobalConfig>(
+        acc: &Self::Accumulators,
+        stage: &mut Self::OutStage,
+        listener: &mut W,
+        partition_scheduler: &PartitionScheduler,
         #[comptime] stage_config: Self::Config,
         #[comptime] global_config: G,
     );
+
+    fn init_scheduler(#[comptime] config: Self::Config) -> PartitionScheduler;
 }
 
 /// Configuration for the Stage matmul (SMM) level
@@ -165,23 +167,35 @@ pub trait StageConfig:
     /// Converts itself to the underlying Tile Matmul config
     fn tile_config(self) -> Self::TileConfig;
 
-    /// Returns the line size for the given ident
-    fn stage_line_size<I: Into<Ident>>(&self, ident: I) -> u32;
+    /// Converts itself to the underlying Stage Memory config
+    fn stage_memory_config(self, ident: StageIdent) -> StageMemoryConfig {
+        let tiling = self.tiling_scheme();
+        StageMemoryConfig {
+            num_main_flow_planes: self.num_main_flow_planes(),
+            elements_in_tile_row: tiling.elements_in_tile_row(ident),
+            elements_in_tile_col: tiling.elements_in_tile_col(ident),
+            tiles_in_stage_row: tiling.tiles_in_stage_row(ident),
+            tiles_in_stage_col: tiling.tiles_in_stage_col(ident),
+            stage_line_size: self.stage_line_size(ident),
+            matrix_layout: self.matrix_layout(ident),
+            num_stages: self.num_stages(ident),
+        }
+    }
 
     /// Returns the line size for the given ident
-    fn global_line_size<I: Into<Ident>>(&self, ident: I) -> u32;
+    fn stage_line_size(&self, ident: StageIdent) -> u32;
+
+    /// Returns the line size for the given ident
+    fn global_line_size(&self, ident: StageIdent) -> u32;
 
     /// Returns the [MatrixLayout] for the given ident
-    fn matrix_layout<I: Into<Ident>>(&self, ident: I) -> MatrixLayout;
+    fn matrix_layout(&self, ident: StageIdent) -> MatrixLayout;
 
     /// Returns how many units are in a plane
     fn plane_dim(&self) -> u32;
 
     /// Returns whether we must perform partition buffering
     fn partition_buffering(&self) -> PartitionBuffering;
-
-    /// Returns the number of stages for the given input
-    fn num_stages(&self, ident: InputIdent) -> u32;
 
     /// Returns the [TilingScheme]
     fn tiling_scheme(&self) -> TilingScheme;
@@ -201,6 +215,11 @@ pub trait StageConfig:
     /// Whether we must sync planes after execution because the execution
     /// is not sync by itself (depends on the runtime/compiler)
     fn must_sync_plane_after_execution(&self) -> bool;
+
+    fn partition_schedule_scheme(&self) -> PartitionSchedulerScheme;
+
+    /// Number of stages in the stage
+    fn num_stages(&self, ident: StageIdent) -> u32;
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -210,18 +229,40 @@ pub enum PartitionBuffering {
     Double,
 }
 
+/// Stage that can be divided into tiles, with the same kind used by the
+/// tile matmul readers.
 #[cube]
-/// Read the tile at (row, col) from stage memory
-pub trait StageToTileReader<ES: Numeric>: CubeType + Send + Sync + 'static {
-    fn read_tile<S: StageConfig>(
-        this: &Self,
-        row: u32,
-        col: u32,
-        #[comptime] config: S,
-    ) -> Tile<ES>;
+pub trait Stage<ES: Numeric, IO: SliceVisibility = ReadOnly>:
+    CubeType + Send + Sync + 'static
+{
+    /// The kind (or family) of the tiles contained in this stage
+    type TileKind: TileKind<IO>;
+
+    /// Slices a tile with offset (`row`, `col`) from the stage and returns it
+    fn tile(this: &Self, tile: Coords2d) -> <Self::TileKind as TileKind<IO>>::Tile<ES>;
 }
 
-/// Reader family for any precision
-pub trait ReaderFamily: Send + Sync + 'static {
-    type Reader<ES: Numeric, T: TilingLayout>: StageToTileReader<ES>;
+/// Stage family for any precision
+pub trait StageFamily<IO: SliceVisibility = ReadOnly>: Send + Sync + 'static {
+    /// The tile kind (family) contained in the stage
+    type TileKind: TileKind<IO>;
+    /// The concrete stage type of this family, instantiated with the type and layout
+    type Stage<ES: Numeric, T: TilingLayout>: Stage<ES, IO, TileKind = Self::TileKind>;
+}
+
+#[cube]
+impl<ES: Numeric, IO: SliceVisibility, Inner: Stage<ES, IO>> Stage<ES, IO> for CubeOption<Inner> {
+    type TileKind = CubeOption<Inner::TileKind>;
+
+    fn tile(this: &Self, tile: Coords2d) -> <Self::TileKind as TileKind<IO>>::Tile<ES> {
+        match this {
+            CubeOption::Some(stage) => CubeOption::new_Some(Inner::tile(stage, tile)),
+            CubeOption::None => CubeOption::new_None(),
+        }
+    }
+}
+
+impl<IO: SliceVisibility, Inner: StageFamily<IO>> StageFamily<IO> for Option<Inner> {
+    type TileKind = CubeOption<Inner::TileKind>;
+    type Stage<ES: Numeric, T: TilingLayout> = CubeOption<Inner::Stage<ES, T>>;
 }

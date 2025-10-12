@@ -4,10 +4,11 @@ use std::mem::transmute;
 
 use crate::{BasicBlock, BlockUse, NodeIndex, Optimizer};
 use cubecl_ir::{
-    Arithmetic, BinaryOperator, Branch, Comparison, ConstantScalarValue, Elem, If, IfElse,
-    Instruction, Item, Loop, Operation, RangeLoop, Switch, Variable, VariableKind,
+    Arithmetic, BinaryOperator, Branch, Comparison, ConstantScalarValue, ElemType, If, IfElse,
+    Instruction, Loop, Operation, RangeLoop, Switch, Type, Variable, VariableKind,
 };
-use petgraph::visit::EdgeRef;
+use petgraph::{Direction, graph::EdgeIndex, visit::EdgeRef};
+use stable_vec::StableVec;
 
 /// Control flow that terminates a block
 #[derive(Default, Debug, Clone)]
@@ -259,7 +260,7 @@ impl Optimizer {
             _ => unreachable!(),
         };
         let i = range_loop.i;
-        self.program.variables.insert(i_id, i.item);
+        self.program.variables.insert(i_id, i.ty);
 
         let assign = Instruction::new(Operation::Copy(range_loop.start), i);
         self.current_block_mut().ops.borrow_mut().push(assign);
@@ -303,13 +304,13 @@ impl Optimizer {
         self.current_block = Some(next);
 
         // For loop constructs
-        self.insert_phi(header, i_id, range_loop.start.item);
+        self.insert_phi(header, i_id, range_loop.start.ty);
         {
             let op = match range_loop.inclusive {
                 true => Comparison::LowerEqual,
                 false => Comparison::Lower,
             };
-            let tmp = *self.allocator.create_local(Item::new(Elem::Bool));
+            let tmp = *self.allocator.create_local(Type::scalar(ElemType::Bool));
             self.program[header].ops.borrow_mut().push(Instruction::new(
                 op(BinaryOperator {
                     lhs: i,
@@ -356,6 +357,70 @@ impl Optimizer {
                 }
             }
         }
+    }
+
+    /// Split blocks at a `free` call because we only track liveness at a block level
+    /// It's easier than doing liveness per-instruction, and free calls are rare anyways
+    pub(crate) fn split_free(&mut self) {
+        let mut splits = 0;
+        while self.split_free_inner() {
+            splits += 1;
+        }
+        if splits > 0 {
+            self.invalidate_structure();
+        }
+    }
+
+    fn split_free_inner(&mut self) -> bool {
+        let is_free = |inst: &Instruction| matches!(inst.operation, Operation::Free(_));
+
+        for block in self.node_ids() {
+            let ops = self.block(block).ops.clone();
+            let len = ops.borrow().num_elements();
+            let idx = ops.borrow().values().position(is_free);
+            if let Some(idx) = idx {
+                // Separate free into its own block. They can be merged again later.
+                if idx > 0 {
+                    self.split_block_after(block, idx - 1);
+                    return true;
+                }
+                if idx < len - 1 {
+                    self.split_block_after(block, idx);
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Split block after `idx` and return the new block
+    fn split_block_after(&mut self, block: NodeIndex, idx: usize) -> NodeIndex {
+        let successors = self.successors(block);
+        let edges: Vec<EdgeIndex> = self
+            .program
+            .edges_directed(block, Direction::Outgoing)
+            .map(|it| it.id())
+            .collect();
+        for edge in edges {
+            self.program.remove_edge(edge);
+        }
+
+        let ops = self.block(block).ops.take();
+        let before: Vec<_> = ops.values().take(idx + 1).cloned().collect();
+        let after: Vec<_> = ops.values().skip(idx + 1).cloned().collect();
+        *self.block(block).ops.borrow_mut() = StableVec::from_iter(before);
+
+        let new_block = BasicBlock::default();
+        new_block.control_flow.swap(&self.block(block).control_flow);
+        new_block.ops.borrow_mut().extend(after);
+        let new_block = self.program.graph.add_node(new_block);
+
+        self.program.add_edge(block, new_block, 0);
+        for successor in successors {
+            self.program.add_edge(new_block, successor, 0);
+        }
+        new_block
     }
 }
 

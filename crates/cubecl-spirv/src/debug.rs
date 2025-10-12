@@ -18,15 +18,11 @@
 
 use std::borrow::Cow;
 
-use cubecl_core::ir::{self as core, CubeFnSource, SourceLoc, Variable};
+use cubecl_core::ir::{self as core, CubeFnSource, Id, SourceLoc, Variable};
 use hashbrown::HashMap;
-use rspirv::spirv::{FunctionControl, Word};
-use rspirv_ext::{
-    spirv::DebugInfoFlags,
-    sr::{
-        nonsemantic_debugprintf::DebugPrintfBuilder,
-        nonsemantic_shader_debuginfo_100::DebugInfoBuilder,
-    },
+use rspirv::spirv::{DebugInfoFlags, FunctionControl, Word};
+use rspirv::sr::{
+    nonsemantic_debugprintf::DebugPrintfBuilder, nonsemantic_shader_debuginfo_100::DebugInfoBuilder,
 };
 
 use crate::{SpirvCompiler, SpirvTarget};
@@ -208,21 +204,24 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
     }
 
     pub fn compile_debug(&mut self, debug: core::NonSemantic) {
+        if let core::NonSemantic::Print {
+            format_string,
+            args,
+        } = &debug
+        {
+            let args = args
+                .iter()
+                .map(|arg| {
+                    let var = self.compile_variable(*arg);
+                    self.read(&var)
+                })
+                .collect::<Vec<_>>();
+            DebugPrintfBuilder::debug_printf(&mut self.builder, format_string, args).unwrap();
+            return;
+        }
         if self.debug_enabled() {
             match debug {
-                core::NonSemantic::Print {
-                    format_string,
-                    args,
-                } => {
-                    let args = args
-                        .into_iter()
-                        .map(|arg| {
-                            let var = self.compile_variable(arg);
-                            self.read(&var)
-                        })
-                        .collect::<Vec<_>>();
-                    self.debug_printf(format_string, args).unwrap();
-                }
+                core::NonSemantic::Print { .. } => panic!("Should already be handled"),
                 core::NonSemantic::Comment { .. } => {
                     // Comments not supported for SPIR-V
                 }
@@ -266,12 +265,16 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             let source = self.debug_source(file.as_ref(), Some(source_text.as_ref()));
 
             let comp_unit = {
-                use rspirv_ext::dr::autogen_nonsemantic_shader_debuginfo_100::DebugInfoOpBuilder;
-
                 let version = self.const_u32(1);
                 let dwarf_version = self.const_u32(5);
                 let language = self.const_u32(13);
-                self.debug_compilation_unit_id(None, version, dwarf_version, source, language)
+                self.shader_debug_compilation_unit_id(
+                    None,
+                    version,
+                    dwarf_version,
+                    source,
+                    language,
+                )
             };
 
             let source_file = SourceFile {
@@ -336,6 +339,13 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
     pub fn debug_var_name(&mut self, id: Word, var: Variable) {
         if self.debug_symbols {
             let name = self.name_of_var(var);
+            self.debug_name(id, name);
+        }
+    }
+
+    pub fn debug_shared(&mut self, id: Word, index: Id) {
+        if self.debug_symbols {
+            let name = format!("shared({index})");
             self.debug_name(id, name);
         }
     }

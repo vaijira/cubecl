@@ -1,10 +1,6 @@
 use cubecl_core::compute::{Binding, Location, Visibility};
-use rspirv::{
-    dr,
-    spirv::{
-        self, AddressingModel, Capability, Decoration, ExecutionModel, MemoryModel, StorageClass,
-        Word,
-    },
+use rspirv::spirv::{
+    self, AddressingModel, Capability, Decoration, ExecutionModel, MemoryModel, StorageClass, Word,
 };
 use std::{fmt::Debug, iter};
 
@@ -70,18 +66,13 @@ impl SpirvTarget for GLCompute {
         b.capability(Capability::VulkanMemoryModelDeviceScope);
         b.capability(Capability::GroupNonUniform);
 
+        if b.compilation_options.supports_explicit_smem {
+            b.extension("SPV_KHR_workgroup_memory_explicit_layout");
+        }
+
         let caps: Vec<_> = b.capabilities.iter().copied().collect();
         for cap in caps.iter() {
             b.capability(*cap);
-        }
-        if b.float_controls {
-            let inst = dr::Instruction::new(
-                spirv::Op::Capability,
-                None,
-                None,
-                vec![dr::Operand::LiteralBit32(6029)],
-            );
-            b.module_mut().capabilities.push(inst);
         }
 
         if caps.contains(&Capability::CooperativeMatrixKHR) {
@@ -103,6 +94,19 @@ impl SpirvTarget for GLCompute {
             | caps.contains(&Capability::AtomicFloat64MinMaxEXT)
         {
             b.extension("SPV_EXT_shader_atomic_float_min_max");
+        }
+
+        if caps.contains(&Capability::BFloat16TypeKHR)
+            || caps.contains(&Capability::BFloat16CooperativeMatrixKHR)
+            || caps.contains(&Capability::BFloat16DotProductKHR)
+        {
+            b.extension("SPV_KHR_bfloat16");
+        }
+
+        if caps.contains(&Capability::Float8EXT)
+            || caps.contains(&Capability::Float8CooperativeMatrixEXT)
+        {
+            b.extension("SPV_EXT_float8");
         }
 
         if b.float_controls {
@@ -134,12 +138,19 @@ impl SpirvTarget for GLCompute {
         name: String,
     ) -> Word {
         let index = binding.id;
-        let item = b.compile_item(binding.item);
+        let item = b.compile_type(binding.ty);
+        let item_size = item.size();
         let item = match binding.size {
             Some(size) => Item::Array(Box::new(item), size as u32),
             None => Item::RuntimeArray(Box::new(item)),
         };
         let arr = item.id(b); // pre-generate type
+
+        if !b.state.array_types.contains(&arr) {
+            b.decorate(arr, Decoration::ArrayStride, [item_size.into()]);
+            b.state.array_types.insert(arr);
+        }
+
         let struct_ty = b.id();
         b.type_struct_id(Some(struct_ty), vec![arr]);
 

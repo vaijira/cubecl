@@ -6,7 +6,7 @@ use super::{
 };
 use std::{
     borrow::Cow,
-    fmt::{Display, Write},
+    fmt::{Display, Formatter, Write},
     marker::PhantomData,
 };
 
@@ -70,6 +70,7 @@ pub enum Instruction<D: Dialect> {
     Modulo(BinaryInstruction<D>),
     Remainder(BinaryInstruction<D>),
     Add(BinaryInstruction<D>),
+    SaturatingAdd(BinaryInstruction<D>),
     Fma {
         a: Variable<D>,
         b: Variable<D>,
@@ -79,6 +80,7 @@ pub enum Instruction<D: Dialect> {
     Div(BinaryInstruction<D>),
     Mul(BinaryInstruction<D>),
     Sub(BinaryInstruction<D>),
+    SaturatingSub(BinaryInstruction<D>),
     HiMul(BinaryInstruction<D>),
     Index(IndexInstruction<D>),
     IndexAssign(IndexAssignInstruction<D>),
@@ -164,6 +166,7 @@ pub enum Instruction<D: Dialect> {
     Sin(UnaryInstruction<D>),
     Tanh(UnaryInstruction<D>),
     Powf(BinaryInstruction<D>),
+    Powi(BinaryInstruction<D>),
     Sqrt(UnaryInstruction<D>),
     Min(BinaryInstruction<D>),
     Max(BinaryInstruction<D>),
@@ -176,6 +179,8 @@ pub enum Instruction<D: Dialect> {
         max_value: Variable<D>,
         out: Variable<D>,
     },
+    IsNan(UnaryInstruction<D>),
+    IsInf(UnaryInstruction<D>),
     SyncThreads,
     SyncWarp,
     ThreadFence,
@@ -186,6 +191,12 @@ pub enum Instruction<D: Dialect> {
     },
     BulkWaitGroupRead {
         max_pending: u32,
+    },
+    TmaReplacePointer {
+        buffer: Variable<D>,
+        offset: Variable<D>,
+        tensor_map: Variable<D>,
+        out: Variable<D>,
     },
     Round(UnaryInstruction<D>),
     Ceil(UnaryInstruction<D>),
@@ -260,6 +271,7 @@ impl<D: Dialect> Display for Instruction<D> {
                 }
             },
             Instruction::Add(it) => Add::format(f, &it.lhs, &it.rhs, &it.out),
+            Instruction::SaturatingAdd(it) => SaturatingAdd::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Slice {
                 input,
                 start,
@@ -300,6 +312,7 @@ impl<D: Dialect> Display for Instruction<D> {
             Instruction::Mul(it) => Mul::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Div(it) => Div::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Sub(it) => Sub::format(f, &it.lhs, &it.rhs, &it.out),
+            Instruction::SaturatingSub(it) => SaturatingSub::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::HiMul(it) => HiMul::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Modulo(inst) => Modulo::format(f, &inst.lhs, &inst.rhs, &inst.out),
             Instruction::BitwiseOr(it) => BitwiseOr::format(f, &it.lhs, &it.rhs, &it.out),
@@ -466,7 +479,7 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
             } => {
                 let out = out.fmt_left();
                 match *split_meta {
-                    true => writeln!(f, "{out} = static_info.x[{info_offset}];"),
+                    true => writeln!(f, "{out} = {STATIC_INFO_NAME}.x[{info_offset}];"),
                     false => writeln!(f, "{out} = {INFO_NAME}[{info_offset}];"),
                 }
             }
@@ -504,6 +517,7 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
             Instruction::Sin(it) => Sin::format(f, &it.input, &it.out),
             Instruction::Tanh(it) => Tanh::format(f, &it.input, &it.out),
             Instruction::Powf(it) => Powf::format(f, &it.lhs, &it.rhs, &it.out),
+            Instruction::Powi(it) => Powi::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Sqrt(it) => Sqrt::format(f, &it.input, &it.out),
             Instruction::Max(it) => Max::format(f, &it.lhs, &it.rhs, &it.out),
             Instruction::Min(it) => Min::format(f, &it.lhs, &it.rhs, &it.out),
@@ -517,6 +531,8 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
                 max_value,
                 out,
             } => Clamp::format(f, input, min_value, max_value, out),
+            Instruction::IsNan(it) => IsNan::format(f, &it.input, &it.out),
+            Instruction::IsInf(it) => IsInf::format(f, &it.input, &it.out),
             Instruction::SyncThreads => D::compile_instruction_sync_threads(f),
             Instruction::SyncWarp => D::compile_instruction_sync_warp(f),
             Instruction::ThreadFence => f.write_str("__threadfence();\n"),
@@ -637,6 +653,24 @@ for ({i_ty} {i} = {start}; {i} {cmp} {end}; {increment}) {{
                 f,
                 "cuda::device::experimental::cp_async_bulk_wait_group_read<{max_pending}>();"
             ),
+            Instruction::TmaReplacePointer {
+                buffer,
+                offset,
+                tensor_map,
+                out,
+            } => {
+                let pos = Variable::<D>::UnitPos;
+                writeln!(f, "__shared__ alignas(128) CUtensorMap {out};")?;
+                writeln!(
+                    f,
+                    "
+if({pos} == 0) {{
+    {out} = {tensor_map};
+    tensormap_replace_global_address({out}, &{buffer}[{offset}]);
+}}"
+                )?;
+                writeln!(f, "__syncthreads();")
+            }
             Instruction::MemCopyAsyncTensorSharedToGlobal {
                 smem_buffer,
                 smem_offset,
@@ -713,37 +747,81 @@ impl<D: Dialect> Clamp<D> {
         max_value: &Variable<D>,
         out: &Variable<D>,
     ) -> core::fmt::Result {
-        let input = input.optimized();
-        let min_value = min_value.optimized();
-        let max_value = max_value.optimized();
-        let out = out.optimized();
         let out_item = out.item();
-        let num = out_item.vectorization;
-
-        let out_fmt = out.fmt_left();
-        if num == 1 {
-            writeln!(f, "{out_fmt} = ")?;
-            D::compile_instruction_max_function_name(f, out.item())?;
-            writeln!(f, "({min_value}, ")?;
-            D::compile_instruction_min_function_name(f, out.item())?;
-            writeln!(f, "({max_value}, {input}));")
+        if out.item().vectorization == 1 {
+            let out = out.fmt_left();
+            write!(f, "{out} = ")?;
+            Self::format_scalar(f, *input, *min_value, *max_value, out_item)?;
+            f.write_str(";\n")
         } else {
-            writeln!(f, "{out_fmt} = {out_item}{{")?;
-            let mut item = out.item();
-            item.vectorization = 1;
+            Self::unroll_vec(f, input, min_value, max_value, out)
+        }
+    }
 
-            for i in 0..num {
+    fn format_scalar(
+        f: &mut Formatter<'_>,
+        input: impl Component<D>,
+        min_value: impl Component<D>,
+        max_value: impl Component<D>,
+        item: Item<D>,
+    ) -> std::fmt::Result {
+        D::compile_instruction_max_function_name(f, item)?;
+        write!(f, "({min_value}, ")?;
+        D::compile_instruction_min_function_name(f, item)?;
+        write!(f, "({max_value}, {input}))")
+    }
+
+    fn unroll_vec(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        min_value: &Variable<D>,
+        max_value: &Variable<D>,
+        out: &Variable<D>,
+    ) -> std::fmt::Result {
+        let optimized = Variable::optimized_args([*input, *min_value, *max_value, *out]);
+        let [input, min_value, max_value, out_optimized] = optimized.args;
+
+        let item_out_original = out.item();
+        let item_out_optimized = out_optimized.item();
+
+        let index = match optimized.optimization_factor {
+            Some(factor) => item_out_original.vectorization / factor,
+            None => item_out_optimized.vectorization,
+        };
+
+        let mut write_op = |input: &Variable<D>,
+                            min_value: &Variable<D>,
+                            max_value: &Variable<D>,
+                            out: &Variable<D>,
+                            item_out: Item<D>| {
+            let out = out.fmt_left();
+            writeln!(f, "{out} = {item_out}{{")?;
+            for i in 0..index {
                 let inputi = input.index(i);
-                let mini = min_value.index(i);
-                let maxi = max_value.index(i);
+                let min_valuei = min_value.index(i);
+                let max_valuei = max_value.index(i);
 
-                D::compile_instruction_max_function_name(f, item)?;
-                writeln!(f, "({mini}, ")?;
-                D::compile_instruction_min_function_name(f, item)?;
-                writeln!(f, "({maxi}, {inputi})),")?;
+                Self::format_scalar(f, inputi, min_valuei, max_valuei, item_out)?;
+                f.write_str(", ")?;
             }
 
             f.write_str("};\n")
+        };
+
+        if item_out_original == item_out_optimized {
+            write_op(&input, &min_value, &max_value, out, item_out_optimized)
+        } else {
+            let out_tmp = Variable::tmp(item_out_optimized);
+            write_op(&input, &min_value, &max_value, &out_tmp, item_out_optimized)?;
+            let addr_space = D::address_space_for_variable(out);
+            let out = out.fmt_left();
+
+            writeln!(
+                f,
+                "{out} = reinterpret_cast<{addr_space}{item_out_original}&>({out_tmp});\n"
+            )?;
+
+            Ok(())
         }
     }
 }

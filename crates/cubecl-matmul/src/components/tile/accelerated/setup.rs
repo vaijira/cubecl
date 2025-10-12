@@ -1,15 +1,24 @@
-use crate::components::error::MatmulSetupError;
-use crate::components::resource::ComputeResources;
-use crate::components::tile::TileMatmulFamily;
 use crate::components::tile::accelerated::config::AcceleratedConfig;
 use crate::components::tile::accelerated::matmul::AcceleratedMatmul;
-use crate::components::{
-    InvalidConfigError, MatmulLineSizes, MatmulPrecision, MatmulProblem, MatmulSelection,
+use crate::components::tile::{
+    TileMatmulFamily,
+    accelerated::reader::{CmmaFragmentReader, CmmaStageReader},
 };
+use crate::components::{InvalidConfigError, MatmulLineSizes, MatmulProblem, MatmulSelection};
+use crate::components::{error::MatmulSetupError, tile::io::Strided};
+use crate::components::{resource::ComputeResources, tile::io::TileKind};
 use cubecl_core::prelude::*;
 
-impl TileMatmulFamily for AcceleratedMatmul {
-    type Matmul<MP: MatmulPrecision> = AcceleratedMatmul;
+impl<Tile: TileKind> TileMatmulFamily for AcceleratedMatmul<Tile>
+where
+    CmmaStageReader<Tile>: CmmaFragmentReader<TileKind = Tile>,
+{
+    type Matmul<L: Numeric, R: Numeric, A: Numeric> = AcceleratedMatmul<Tile>;
+    type LhsTile = Strided;
+    type RhsTile = Strided;
+    type AccTile = Tile;
+    type OutTile = Strided;
+
     type Config = AcceleratedConfig;
 
     fn requires_accelerator() -> bool {
@@ -20,15 +29,15 @@ impl TileMatmulFamily for AcceleratedMatmul {
         Ok(ComputeResources::Planes(1))
     }
 
-    fn setup<MP: MatmulPrecision, R: Runtime>(
+    fn setup<Lhs: Numeric, Rhs: Numeric, Acc: Numeric, R: Runtime>(
         client: &ComputeClient<R::Server, R::Channel>,
         problem: &MatmulProblem,
         selection: &MatmulSelection,
         matmul_line_sizes: &MatmulLineSizes,
     ) -> Result<Self::Config, MatmulSetupError> {
-        AcceleratedConfig::new::<MP, R>(
+        AcceleratedConfig::new::<Lhs, Rhs, Acc, R>(
             client,
-            selection.tiling_scheme,
+            selection.tiling_scheme.tile_size,
             selection.plane_dim,
             problem.lhs_layout,
             problem.rhs_layout,

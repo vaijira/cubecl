@@ -1,14 +1,17 @@
-use std::hash::Hash;
 use std::{collections::HashSet, fmt::Debug};
+use std::{fmt::Display, hash::Hash};
 
-use cubecl_core::ir::Id;
+use cubecl_core::ir::Processor;
 
-use crate::shared::FmtLeft;
+use crate::shared::{
+    FmtLeft, IndexedVariable, MmaShape, SupportedMmaCombinations, SupportedScaledMmaCombinations,
+    reduce_comparison, reduce_exclusive, reduce_inclusive, reduce_operator, reduce_quantifier,
+};
 
 use super::{
     Architecture, AtomicKind, Binding, Body, Component, CubeIndexFlags, Elem, Flags, Fragment,
-    FragmentIdent, FragmentLayout, Instruction, Item, SharedMemory, SupportedWmmaCombinations,
-    Variable, WarpInstruction, WmmaInstruction,
+    FragmentIdent, FragmentLayout, Instruction, Item, SharedMemory, Variable, WarpInstruction,
+    WmmaInstruction,
 };
 
 // Base dialect
@@ -17,9 +20,11 @@ pub trait Dialect:
     DialectIncludes<Self>
     + DialectTypes<Self>
     + DialectBindings<Self>
+    + DialectWarpReduceCompiler<Self>
     + DialectCubeBuiltins<Self>
     + DialectInstructions<Self>
     + DialectWmmaCompiler<Self>
+    + DialectProcessors<Self>
     + Default
     + Clone
     + Copy
@@ -51,6 +56,12 @@ pub trait DialectIncludes<D: Dialect> {
         extensions: &mut Vec<Self::Extension>,
         instruction: &WarpInstruction<D>,
     );
+    #[allow(unused_variables)]
+    fn register_wmma_instruction_extension(
+        extensions: &mut Vec<Self::Extension>,
+        instruction: &WmmaInstruction<D>,
+    ) {
+    }
 }
 
 // Types
@@ -91,7 +102,18 @@ pub trait DialectTypes<D: Dialect> {
     fn compile_shared_memory_declaration(
         f: &mut std::fmt::Formatter<'_>,
         shared: &SharedMemory<D>,
-    ) -> std::fmt::Result;
+    ) -> std::fmt::Result {
+        let item = shared.item;
+        let index = shared.index;
+        let offset = shared.offset;
+        let size = shared.length;
+        let size_bytes = size * shared.item.size() as u32;
+        writeln!(f, "// Shared memory size: {size}, {size_bytes} bytes")?;
+        writeln!(
+            f,
+            "{item} *shared_memory_{index} = reinterpret_cast<{item}*>(&dynamic_shared_mem[{offset}]);"
+        )
+    }
     fn compile_polyfills(_f: &mut std::fmt::Formatter<'_>, _flags: &Flags) -> std::fmt::Result {
         Ok(())
     }
@@ -107,7 +129,7 @@ pub trait DialectBindings<D: Dialect> {
     fn compile_kernel_signature(
         f: &mut std::fmt::Formatter<'_>,
         kernel_name: &str,
-        tensor_maps: &[Id],
+        tensor_maps: &[Binding<D>],
         buffers: &[Binding<D>],
         scalars: &[(Elem<D>, usize)],
         flags: &Flags,
@@ -477,22 +499,32 @@ pub trait DialectInstructions<D: Dialect> {
         writeln!(f, "{out} = atomicXor({lhs}, {rhs});")
     }
 
+    fn compile_saturating_add(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: impl Display,
+        rhs: impl Display,
+        item: Item<D>,
+    ) -> std::fmt::Result;
+
+    fn compile_saturating_sub(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: impl Display,
+        rhs: impl Display,
+        item: Item<D>,
+    ) -> std::fmt::Result;
+
     // debug
     fn compile_instruction_printf(
         f: &mut std::fmt::Formatter<'_>,
         format_string: &str,
         args: &[Variable<D>],
     ) -> std::fmt::Result {
-        let format_string = format_string
-            .replace("\t", "\\t")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r");
         let args = args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>();
         let args = match args.is_empty() {
             true => "".to_string(),
             false => format!(", {}", args.join(",")),
         };
-        writeln!(f, "printf(\"{format_string}\"{args});")
+        writeln!(f, "printf({format_string:?}{args});")
     }
 
     // logs
@@ -588,8 +620,17 @@ pub trait DialectInstructions<D: Dialect> {
         item: Item<D>,
     ) -> std::fmt::Result;
 
-    fn compile_instruction_powf(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "powf")
+    fn compile_instruction_powf(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: &str,
+        rhs: &str,
+        elem: Elem<D>,
+    ) -> std::fmt::Result {
+        match elem {
+            Elem::F32 => write!(f, "powf({lhs}, {rhs})"),
+            Elem::F64 => write!(f, "pow({lhs}, {rhs})"),
+            _ => panic!("Unsupported type for powf"),
+        }
     }
 
     fn compile_instruction_half_function_name_prefix() -> &'static str {
@@ -637,33 +678,158 @@ pub trait DialectInstructions<D: Dialect> {
     ) -> std::fmt::Result;
 }
 
-// Coop Matrices dialect
+#[derive(Debug, Clone, Copy, new)]
+pub struct ManualMma<'a, D: Dialect> {
+    pub shape: MmaShape<D>,
+    pub frag_a: &'a [Variable<D>],
+    pub frag_b: &'a [Variable<D>],
+    pub frag_c: &'a [Variable<D>],
+    pub frag_d: &'a Variable<D>,
+}
+
+pub trait DialectWarpReduceCompiler<D: Dialect>:
+    Default + Clone + Copy + Debug + Send + Sync + Eq + Hash + 'static
+{
+    fn warp_reduce_sum(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_operator(f, input, out, "+=")
+    }
+    fn warp_reduce_prod(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_operator(f, input, out, "*=")
+    }
+    fn warp_reduce_max(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_comparison(f, input, out, D::compile_instruction_max_function_name)
+    }
+    fn warp_reduce_min(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_comparison(f, input, out, D::compile_instruction_min_function_name)
+    }
+    fn warp_reduce_all(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_quantifier(f, input, out, D::compile_warp_all::<IndexedVariable<D>>)
+    }
+    fn warp_reduce_any(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_quantifier(f, input, out, D::compile_warp_any::<IndexedVariable<D>>)
+    }
+    fn warp_reduce_sum_inclusive(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_inclusive(f, input, out, "+=")
+    }
+    fn warp_reduce_prod_inclusive(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_inclusive(f, input, out, "*=")
+    }
+    fn warp_reduce_sum_exclusive(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_exclusive(f, input, out, "+=", "0")
+    }
+    fn warp_reduce_prod_exclusive(
+        f: &mut core::fmt::Formatter<'_>,
+        input: &Variable<D>,
+        out: &Variable<D>,
+    ) -> core::fmt::Result {
+        reduce_exclusive(f, input, out, "*=", "1")
+    }
+}
 
 pub trait DialectWmmaCompiler<D: Dialect>:
     Default + Clone + Copy + Debug + Send + Sync + Eq + Hash + 'static
 {
-    fn compile_wmma_includes(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
-    fn compile_wmma_type_definitions(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
-    fn compile_wmma_local_variables(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
+    #[allow(unused_variables)]
+    fn compile_wmma_includes(f: &mut std::fmt::Formatter<'_>, flags: &Flags) -> std::fmt::Result {
+        Ok(())
+    }
+    #[allow(unused_variables)]
+    fn compile_wmma_type_definitions(
+        f: &mut std::fmt::Formatter<'_>,
+        flags: &Flags,
+    ) -> std::fmt::Result {
+        Ok(())
+    }
+    #[allow(unused_variables)]
+    fn compile_wmma_local_variables(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+    #[allow(unused_variables)]
+    fn compile_wwma_fragment_ident(
+        f: &mut std::fmt::Formatter<'_>,
+        ident: &FragmentIdent<D>,
+    ) -> std::fmt::Result {
+        Ok(())
+    }
+    #[allow(unused_variables)]
+    fn compile_wmma_fragment_layout(
+        f: &mut std::fmt::Formatter<'_>,
+        layout: &FragmentLayout<D>,
+    ) -> std::fmt::Result {
+        Ok(())
+    }
+    #[allow(unused_variables)]
+    fn compile_wmma_fragment(
+        f: &mut std::fmt::Formatter<'_>,
+        fragment: &Fragment<D>,
+    ) -> std::fmt::Result {
+        Ok(())
+    }
+
     fn compile_wmma_fragment_declaration(
         f: &mut std::fmt::Formatter<'_>,
         var: &Variable<D>,
     ) -> std::fmt::Result;
-    fn compile_wwma_fragment_ident(
-        f: &mut std::fmt::Formatter<'_>,
-        ident: &FragmentIdent<D>,
-    ) -> std::fmt::Result;
-    fn compile_wmma_fragment_layout(
-        f: &mut std::fmt::Formatter<'_>,
-        layout: &FragmentLayout<D>,
-    ) -> std::fmt::Result;
-    fn compile_wmma_fragment(
-        f: &mut std::fmt::Formatter<'_>,
-        fragment: &Fragment<D>,
-    ) -> std::fmt::Result;
+
     fn compile_wmma_instruction(
         f: &mut std::fmt::Formatter<'_>,
         instruction: &WmmaInstruction<D>,
     ) -> std::fmt::Result;
-    fn supported_wmma_combinations(arch: &D::Architecture) -> SupportedWmmaCombinations;
+    fn compile_manual_mma(f: &mut std::fmt::Formatter<'_>, mma: ManualMma<D>) -> std::fmt::Result;
+    fn compile_scaled_mma(
+        f: &mut std::fmt::Formatter<'_>,
+        mma: ManualMma<D>,
+        scales_a: Variable<D>,
+        scales_b: Variable<D>,
+        scales_factor: u32,
+    ) -> std::fmt::Result;
+    fn supported_wmma_combinations(arch: &D::Architecture) -> SupportedMmaCombinations;
+    fn supported_mma_combinations(arch: &D::Architecture) -> SupportedMmaCombinations;
+    fn supported_scaled_mma_combinations(
+        _arch: &D::Architecture,
+    ) -> SupportedScaledMmaCombinations {
+        Vec::new()
+    }
+}
+
+/// IR Processors to be applied to the scopes during processing. [`CheckedIO`] is always applied
+/// by default, so these are only for target specific processors like MMA index processors.
+pub trait DialectProcessors<D: Dialect> {
+    fn processors() -> Vec<Box<dyn Processor>>;
 }

@@ -1,14 +1,17 @@
 use core::marker::PhantomData;
 
-use cubecl_core::{Runtime, client::ComputeClient, ir::Elem};
+use cubecl_core::{Runtime, client::ComputeClient};
 
 use crate::{
     components::{
-        MatmulProblem, MatmulSelection,
+        MatmulElems, MatmulLineSizes, MatmulProblem, MatmulSelection, MatmulSetupError,
         batch::{PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
-        global::single_stage::tma::SimpleTmaMatmulFamily,
-        stage::{FullReaderFamily, PlaneMatmulFamily},
-        tile::TileMatmulFamily,
+        global::{PlaneWriterFamily, single_stage::tma::SimpleTmaMatmulFamily},
+        stage::{FilledStageFamily, PlaneMatmulFamily, StridedStageFamily},
+        tile::{
+            TileMatmulFamily,
+            io::{Filled, Strided},
+        },
     },
     kernels::layered::{Algorithm, selector::plane_matmul_selection},
 };
@@ -20,12 +23,18 @@ pub struct SimpleTmaAlgorithm<TMM> {
 
 impl<TMM> Algorithm for SimpleTmaAlgorithm<TMM>
 where
-    TMM: TileMatmulFamily,
+    TMM:
+        TileMatmulFamily<LhsTile = Strided, RhsTile = Strided, AccTile = Filled, OutTile = Strided>,
 {
     type SelectionArgs = ();
     type TileMatmul = TMM;
-    type StageMatmul = PlaneMatmulFamily<Self::TileMatmul, FullReaderFamily, FullReaderFamily>;
-    type GlobalMatmul = SimpleTmaMatmulFamily<Self::StageMatmul>;
+    type StageMatmul = PlaneMatmulFamily<
+        Self::TileMatmul,
+        StridedStageFamily,
+        StridedStageFamily,
+        FilledStageFamily,
+    >;
+    type GlobalMatmul = SimpleTmaMatmulFamily<Self::StageMatmul, PlaneWriterFamily>;
     type BatchMatmul =
         PartitionedBatchMatmulFamily<Self::GlobalMatmul, RowMajorGlobalPartitionMatmul>;
 
@@ -33,17 +42,10 @@ where
         client: &ComputeClient<R::Server, R::Channel>,
         problem: &MatmulProblem,
         plane_dim: u32,
-        elem_stage: Elem,
-        elem_acc: Elem,
+        _line_sizes: &MatmulLineSizes,
+        elems: MatmulElems,
         _args: &Self::SelectionArgs,
-    ) -> MatmulSelection {
-        plane_matmul_selection::<TMM, R>(
-            client,
-            problem,
-            plane_dim,
-            elem_stage,
-            elem_acc,
-            Default::default(),
-        )
+    ) -> Result<MatmulSelection, MatmulSetupError> {
+        plane_matmul_selection::<TMM, R>(client, problem, plane_dim, elems, Default::default())
     }
 }

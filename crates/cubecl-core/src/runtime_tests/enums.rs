@@ -3,7 +3,7 @@ use cubecl::prelude::*;
 
 #[derive_cube_comptime]
 #[derive(CubeLaunch, CubeType)]
-pub enum TestEnum<T: CubeLaunch> {
+pub enum TestEnum<T: LaunchArg> {
     A(i32, u32),
     B(BStruct),
     C(T),
@@ -79,7 +79,7 @@ pub fn test_scalar_enum<R: Runtime>(client: ComputeClient<R::Server, R::Channel>
         TestEnumArgs::<i32, R>::C(ScalarArg::new(10)),
         unsafe { ArrayArg::<R>::from_raw_parts::<f32>(&array, 1, 1) },
     );
-    let bytes = client.read_one(array.binding());
+    let bytes = client.read_one(array);
     let actual = f32::from_bytes(&bytes);
 
     assert_eq!(actual[0], 10.0);
@@ -118,14 +118,14 @@ pub fn test_array_float_int<R: Runtime, T: CubePrimitive + CubeElement>(
         },
     );
 
-    let bytes = client.read_one(array.binding());
+    let bytes = client.read_one(array);
     let actual = T::from_bytes(&bytes);
 
     assert_eq!(actual[0], expected);
 }
 
 #[derive(CubeLaunch, CubeType)]
-pub enum SimpleEnum<T: CubeLaunch> {
+pub enum SimpleEnum<T: LaunchArg> {
     Variant(T),
 }
 
@@ -156,7 +156,7 @@ pub fn test_tuple_enum<R: Runtime>(client: &ComputeClient<R::Server, R::Channel>
         }),
     );
 
-    let bytes = client.read_one(first.binding());
+    let bytes = client.read_one(first);
     let actual = u32::from_bytes(&bytes);
 
     assert_eq!(actual[0], 5);

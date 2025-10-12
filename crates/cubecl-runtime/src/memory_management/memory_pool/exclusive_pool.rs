@@ -1,5 +1,6 @@
 use crate::{
-    memory_management::{MemoryUsage, StorageExclude},
+    memory_management::{BytesFormat, MemoryUsage},
+    server::IoError,
     storage::{ComputeStorage, StorageHandle, StorageUtilization},
 };
 
@@ -19,6 +20,28 @@ pub struct ExclusiveMemoryPool {
     last_dealloc_check: u64,
     max_alloc_size: u64,
     cur_avg_size: f64,
+}
+
+impl core::fmt::Display for ExclusiveMemoryPool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!(
+            " - Exclusive Pool max_alloc_size={}\n",
+            BytesFormat::new(self.max_alloc_size)
+        ))?;
+
+        for page in self.pages.iter() {
+            let is_free = page.slice.is_free();
+            let size = BytesFormat::new(page.slice.effective_size());
+
+            f.write_fmt(format_args!("   - Page {size} is_free={is_free}\n"))?;
+        }
+
+        if !self.pages.is_empty() {
+            f.write_fmt(format_args!("\n{}\n", self.get_memory_usage()))?;
+        }
+
+        Ok(())
+    }
 }
 
 const SIZE_AVG_DECAY: f64 = 0.01;
@@ -49,19 +72,11 @@ impl ExclusiveMemoryPool {
 
     /// Finds a free page that can contain the given size
     /// Returns a slice on that page if successful.
-    fn get_free_page(
-        &mut self,
-        size: u64,
-        exclude: Option<&StorageExclude>,
-    ) -> Option<&mut MemoryPage> {
+    fn get_free_page(&mut self, size: u64) -> Option<&mut MemoryPage> {
         // Return the smallest free page that fits.
         self.pages
             .iter_mut()
-            .filter(|page| {
-                page.alloc_size >= size
-                    && page.slice.is_free()
-                    && !exclude.is_some_and(|e| e.is_excluded(page.slice.storage.id))
-            })
+            .filter(|page| page.alloc_size >= size && page.slice.is_free())
             .min_by_key(|page| page.free_count)
     }
 
@@ -69,12 +84,12 @@ impl ExclusiveMemoryPool {
         &mut self,
         storage: &mut Storage,
         size: u64,
-    ) -> &mut MemoryPage {
+    ) -> Result<&mut MemoryPage, IoError> {
         let alloc_size = (self.cur_avg_size as u64)
             .max(size)
             .next_multiple_of(self.alignment);
 
-        let storage = storage.alloc(alloc_size);
+        let storage = storage.alloc(alloc_size)?;
 
         let handle = SliceHandle::new();
         let padding = calculate_padding(size, self.alignment);
@@ -94,7 +109,7 @@ impl ExclusiveMemoryPool {
         });
 
         let idx = self.pages.len() - 1;
-        &mut self.pages[idx]
+        Ok(&mut self.pages[idx])
     }
 }
 
@@ -112,13 +127,13 @@ impl MemoryPool for ExclusiveMemoryPool {
     /// a handle to the reserved memory.
     ///
     /// Also clean ups, merging free slices together if permitted by the merging strategy
-    fn try_reserve(&mut self, size: u64, exclude: Option<&StorageExclude>) -> Option<SliceHandle> {
+    fn try_reserve(&mut self, size: u64) -> Option<SliceHandle> {
         self.cur_avg_size =
             self.cur_avg_size * (1.0 - SIZE_AVG_DECAY) + size as f64 * SIZE_AVG_DECAY;
 
         let padding = calculate_padding(size, self.alignment);
 
-        self.get_free_page(size, exclude).map(|page| {
+        self.get_free_page(size).map(|page| {
             // Return a smaller part of the slice. By construction, we only ever
             // get a page with a big enough size, so this is ok to do.
             page.slice.storage.utilization = StorageUtilization { offset: 0, size };
@@ -128,13 +143,17 @@ impl MemoryPool for ExclusiveMemoryPool {
         })
     }
 
-    fn alloc<Storage: ComputeStorage>(&mut self, storage: &mut Storage, size: u64) -> SliceHandle {
-        assert!(
-            size <= self.max_alloc_size,
-            "Should allocate less than maximum size in pool!"
-        );
-        let page = self.alloc_page(storage, size);
-        page.slice.handle.clone()
+    fn alloc<Storage: ComputeStorage>(
+        &mut self,
+        storage: &mut Storage,
+        size: u64,
+    ) -> Result<SliceHandle, IoError> {
+        if size > self.max_alloc_size {
+            return Err(IoError::BufferTooBig(size as usize));
+        }
+
+        let page = self.alloc_page(storage, size)?;
+        Ok(page.slice.handle.clone())
     }
 
     fn get_memory_usage(&self) -> MemoryUsage {

@@ -1,7 +1,7 @@
-use cubecl_core::{CubeCount, CubeDim, LineSizeError, ir::Elem};
+use cubecl_core::{CubeCount, CubeDim, LineSizeError, ir::StorageType};
 use std::fmt::{Debug, Display};
 
-use crate::components::TileSize;
+use crate::components::{MatrixLayout, TileSize};
 
 /// Errors that can occur during the setup phase of a matmul operation.
 pub enum MatmulSetupError {
@@ -27,13 +27,24 @@ pub enum MatmulAvailabilityError {
     PlaneDimUnsupported { plane_dim: u32 },
 
     /// The required data types for input or output are not supported.
-    TypesUnavailable { input: Elem, output: Elem },
+    TypesUnavailable {
+        lhs: StorageType,
+        rhs: StorageType,
+        output: StorageType,
+    },
 
     /// The required CMMA instruction is not supported for the given element types and tile size.
     CmmaInstructionUnavailable {
-        input: Elem,
-        output: Elem,
+        lhs: StorageType,
+        rhs: StorageType,
+        output: StorageType,
         size: Option<TileSize>,
+    },
+
+    /// The layout of the matmul is unsupported
+    LayoutUnsupported {
+        lhs: MatrixLayout,
+        rhs: MatrixLayout,
     },
 
     /// Barrier synchronization is not available in the runtime.
@@ -44,6 +55,9 @@ pub enum MatmulAvailabilityError {
 
     /// Dynamic selection of line size is unsupported in the current runtime.
     DynamicLineSizeUnavailable,
+
+    /// Plane operations like plane_sum are unavailable
+    PlaneOpsUnavailable,
 }
 impl From<MatmulAvailabilityError> for MatmulSetupError {
     fn from(value: MatmulAvailabilityError) -> Self {
@@ -110,30 +124,42 @@ impl Debug for MatmulAvailabilityError {
                     "Plane dimension unsupported: {plane_dim}. Only 32 & 64 are supported."
                 )
             }
-            MatmulAvailabilityError::TypesUnavailable { input, output } => {
+            MatmulAvailabilityError::TypesUnavailable { lhs, rhs, output } => {
                 writeln!(
                     f,
-                    "Types input={input:?} and/or output={output:?} not supported.",
+                    "Types lhs={lhs:?}, rhs={rhs:?} and/or output={output:?} not supported.",
                 )
             }
             MatmulAvailabilityError::CmmaInstructionUnavailable {
-                input,
+                lhs,
+                rhs,
                 output,
                 size: Some(size),
             } => writeln!(
                 f,
-                "Cmma on inputs {:?} and outputs {:?} with shape m={:?}, n={:?}, k={:?} not supported.",
-                input,
+                "Cmma on lhs {:?} rhs {:?} and output {:?} with shape m={:?}, n={:?}, k={:?} not supported.",
+                lhs,
+                rhs,
                 output,
                 size.m(),
                 size.n(),
                 size.k()
             ),
+            MatmulAvailabilityError::LayoutUnsupported { lhs, rhs } => {
+                writeln!(
+                    f,
+                    "Cmma with layouts lhs {lhs:?} and rhs {rhs:?} not supported."
+                )
+            }
             MatmulAvailabilityError::CmmaInstructionUnavailable {
-                input,
+                lhs,
+                rhs,
                 output,
                 size: None,
-            } => writeln!(f, "Cmma on inputs {input:?} and outputs {output:?}.",),
+            } => writeln!(
+                f,
+                "Cmma on inputs lhs {lhs:?} rhs {rhs:?} and output {output:?} not supported.",
+            ),
             MatmulAvailabilityError::BarrierUnavailable => {
                 writeln!(f, "Barrier is not available.")
             }
@@ -142,6 +168,9 @@ impl Debug for MatmulAvailabilityError {
             }
             MatmulAvailabilityError::DynamicLineSizeUnavailable => {
                 writeln!(f, "Dynamic line size is not available.")
+            }
+            MatmulAvailabilityError::PlaneOpsUnavailable => {
+                writeln!(f, "Plane-wide operations like plane_sum are not available.")
             }
         }
     }

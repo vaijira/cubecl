@@ -1,5 +1,5 @@
 use crate::components::{
-    InputIdent, MatmulLineSizes, TilingScheme,
+    MatmulIdent, MatmulLineSizes, TilingScheme,
     error::MatmulSetupError,
     global::{GlobalConfig, multi_stage::LoadMaxRoundPlaneCount},
 };
@@ -22,29 +22,29 @@ pub(crate) fn shared_global_config_validation<G: GlobalConfig>(
     Ok(config)
 }
 
-/// Maximal number of planes each loader can handle to divide its workload evenly
-pub struct MaxLoaderPlanes {
+/// Maximal number of planes each reader can handle to divide its workload evenly
+pub struct MaxGlobalReaderPlanes {
     pub lhs: u32,
     pub rhs: u32,
 }
 
-impl MaxLoaderPlanes {
-    /// Create a MaxLoaderPlanes
+impl MaxGlobalReaderPlanes {
+    /// Create a MaxGlobalReaderPlanes
     pub fn new<LL: LoadMaxRoundPlaneCount, RL: LoadMaxRoundPlaneCount>(
         tiling_scheme: &TilingScheme,
         line_sizes: &MatmulLineSizes,
         plane_dim: u32,
     ) -> Self {
-        MaxLoaderPlanes {
+        MaxGlobalReaderPlanes {
             lhs: LL::max_round_plane_count(
                 tiling_scheme,
-                InputIdent::Lhs,
+                MatmulIdent::Lhs,
                 line_sizes.lhs,
                 plane_dim,
             ),
             rhs: RL::max_round_plane_count(
                 tiling_scheme,
-                InputIdent::Rhs,
+                MatmulIdent::Rhs,
                 line_sizes.rhs,
                 plane_dim,
             ),

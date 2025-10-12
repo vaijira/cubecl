@@ -1,11 +1,14 @@
-use alloc::{borrow::Cow, boxed::Box, rc::Rc, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, rc::Rc, string::ToString, vec::Vec};
 use core::{any::TypeId, cell::RefCell, fmt::Display};
 use hashbrown::{HashMap, HashSet};
 
-use crate::{BarrierLevel, CubeFnSource, ExpandElement, Matrix, Processor, SourceLoc, TypeHash};
+use crate::{
+    BarrierLevel, CubeFnSource, ExpandElement, Matrix, Processor, SourceLoc, StorageType,
+    TargetProperties, TypeHash,
+};
 
 use super::{
-    Allocator, Elem, Id, Instruction, Item, Variable, VariableKind, processing::ScopeProcessing,
+    Allocator, Id, Instruction, Type, Variable, VariableKind, processing::ScopeProcessing,
 };
 
 /// The scope is the main [operation](Operation) and [variable](Variable) container that simplify
@@ -33,7 +36,8 @@ pub struct Scope {
     pub debug: DebugInfo,
     #[type_hash(skip)]
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub typemap: Rc<RefCell<HashMap<TypeId, Elem>>>,
+    pub typemap: Rc<RefCell<HashMap<TypeId, StorageType>>>,
+    pub runtime_properties: Rc<TargetProperties>,
 }
 
 /// Debug related fields, most of these are global
@@ -99,6 +103,7 @@ impl Scope {
                 entry_loc: None,
             },
             typemap: Default::default(),
+            runtime_properties: Rc::new(Default::default()),
         }
     }
 
@@ -120,15 +125,15 @@ impl Scope {
     }
 
     /// Create a new pipeline element.
-    pub fn create_pipeline(&mut self, item: Item, num_stages: u8) -> ExpandElement {
-        let pipeline = self.allocator.create_pipeline(item, num_stages);
+    pub fn create_pipeline(&mut self, num_stages: u8) -> ExpandElement {
+        let pipeline = self.allocator.create_pipeline(num_stages);
         self.add_pipeline(*pipeline);
         pipeline
     }
 
     /// Create a new barrier element.
-    pub fn create_barrier(&mut self, item: Item, level: BarrierLevel) -> ExpandElement {
-        let barrier = self.allocator.create_barrier(item, level);
+    pub fn create_barrier(&mut self, level: BarrierLevel) -> ExpandElement {
+        let barrier = self.allocator.create_barrier(level);
         self.add_barrier(*barrier);
         barrier
     }
@@ -142,7 +147,7 @@ impl Scope {
     }
 
     /// Create a mutable variable of the given [item type](Item).
-    pub fn create_local_mut<I: Into<Item>>(&mut self, item: I) -> ExpandElement {
+    pub fn create_local_mut<I: Into<Type>>(&mut self, item: I) -> ExpandElement {
         self.allocator.create_local_mut(item.into())
     }
 
@@ -155,12 +160,12 @@ impl Scope {
 
     /// Create a new restricted variable. The variable is
     /// Useful for _for loops_ and other algorithms that require the control over initialization.
-    pub fn create_local_restricted(&mut self, item: Item) -> ExpandElement {
+    pub fn create_local_restricted(&mut self, item: Type) -> ExpandElement {
         self.allocator.create_local_restricted(item)
     }
 
     /// Create a new immutable variable.
-    pub fn create_local(&mut self, item: Item) -> ExpandElement {
+    pub fn create_local(&mut self, item: Type) -> ExpandElement {
         self.allocator.create_local(item)
     }
 
@@ -177,7 +182,7 @@ impl Scope {
     }
 
     /// Resolve the element type of the given generic type.
-    pub fn resolve_elem<T: 'static>(&self) -> Option<Elem> {
+    pub fn resolve_type<T: 'static>(&self) -> Option<StorageType> {
         let map = self.typemap.borrow();
         let result = map.get(&TypeId::of::<T>());
 
@@ -185,7 +190,7 @@ impl Scope {
     }
 
     /// Register the element type for the given generic type.
-    pub fn register_elem<T: 'static>(&mut self, elem: Elem) {
+    pub fn register_type<T: 'static>(&mut self, elem: StorageType) {
         let mut map = self.typemap.borrow_mut();
 
         map.insert(TypeId::of::<T>(), elem);
@@ -207,6 +212,7 @@ impl Scope {
             allocator: self.allocator.clone(),
             debug: self.debug.clone(),
             typemap: self.typemap.clone(),
+            runtime_properties: self.runtime_properties.clone(),
         }
     }
 
@@ -216,9 +222,9 @@ impl Scope {
     ///
     /// New operations and variables can be created within the same scope without having name
     /// conflicts.
-    pub fn process(
+    pub fn process<'a>(
         &mut self,
-        processors: impl IntoIterator<Item = Box<dyn Processor>>,
+        processors: impl IntoIterator<Item = &'a dyn Processor>,
     ) -> ScopeProcessing {
         let mut variables = core::mem::take(&mut self.locals);
 
@@ -244,6 +250,9 @@ impl Scope {
             processing = p.transform(processing, self.allocator.clone());
         }
 
+        // Add variables added from processors
+        processing.variables.extend(self.allocator.take_variables());
+
         processing
     }
 
@@ -252,7 +261,7 @@ impl Scope {
     }
 
     /// Create a shared variable of the given [item type](Item).
-    pub fn create_shared<I: Into<Item>>(
+    pub fn create_shared<I: Into<Type>>(
         &mut self,
         item: I,
         shared_memory_size: u32,
@@ -264,6 +273,7 @@ impl Scope {
             VariableKind::SharedMemory {
                 id: index,
                 length: shared_memory_size,
+                unroll_factor: 1,
                 alignment,
             },
             item,
@@ -273,7 +283,7 @@ impl Scope {
     }
 
     /// Create a shared variable of the given [item type](Item).
-    pub fn create_const_array<I: Into<Item>>(
+    pub fn create_const_array<I: Into<Type>>(
         &mut self,
         item: I,
         data: Vec<Variable>,
@@ -284,6 +294,7 @@ impl Scope {
             VariableKind::ConstantArray {
                 id: index,
                 length: data.len() as u32,
+                unroll_factor: 1,
             },
             item,
         );
@@ -292,7 +303,7 @@ impl Scope {
     }
 
     /// Obtain the index-th input
-    pub fn input(&mut self, id: Id, item: Item) -> ExpandElement {
+    pub fn input(&mut self, id: Id, item: Type) -> ExpandElement {
         ExpandElement::Plain(crate::Variable::new(
             VariableKind::GlobalInputArray(id),
             item,
@@ -300,21 +311,21 @@ impl Scope {
     }
 
     /// Obtain the index-th output
-    pub fn output(&mut self, id: Id, item: Item) -> ExpandElement {
+    pub fn output(&mut self, id: Id, item: Type) -> ExpandElement {
         let var = crate::Variable::new(VariableKind::GlobalOutputArray(id), item);
         ExpandElement::Plain(var)
     }
 
     /// Obtain the index-th scalar
-    pub fn scalar(&self, id: Id, elem: Elem) -> ExpandElement {
+    pub fn scalar(&self, id: Id, storage: StorageType) -> ExpandElement {
         ExpandElement::Plain(crate::Variable::new(
             VariableKind::GlobalScalar(id),
-            Item::new(elem),
+            Type::new(storage),
         ))
     }
 
     /// Create a local array of the given [item type](Item).
-    pub fn create_local_array<I: Into<Item>>(&mut self, item: I, array_size: u32) -> ExpandElement {
+    pub fn create_local_array<I: Into<Type>>(&mut self, item: I, array_size: u32) -> ExpandElement {
         let local_array = self.allocator.create_local_array(item.into(), array_size);
         self.add_local_array(*local_array);
         local_array

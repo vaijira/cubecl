@@ -1,20 +1,24 @@
-use crate::components::global::load::{
-    StageIdent, SyncFullLoader, SyncFullLoadingStrategy, SyncPartialLoader,
-    SyncPartialLoadingStrategy,
+use crate::components::global::Specializer;
+use crate::components::global::{self, GlobalConfig, GlobalWriter};
+use crate::components::{
+    AccG,
+    global::read::{
+        StageBuffer, SyncFullLoadingStrategy, SyncFullStageGlobalReader,
+        SyncPartialLoadingStrategy, SyncPartialStageGlobalReader, ZeroGlobalReader,
+    },
 };
-use crate::components::global::multi_stage::double_buffer_execution::{
-    execute_current_and_load_next, execute_last_and_write_results, load_first,
+use crate::components::{AccS, global::multi_stage::ordered::LL};
+use crate::components::{LhsG, LhsS, MatmulIdent, MatmulPrecision, RhsG, RhsS, stage};
+use crate::components::{
+    global::multi_stage::double_buffer_execution::{
+        execute_current_and_read_next, execute_last_and_write_results, read_first,
+    },
+    stage::{FilledStage, StridedStage},
 };
-use crate::components::global::multi_stage::ordered::LL;
-use crate::components::global::{self, GlobalConfig, ZeroAccumulatorLoader};
-use crate::components::global::{Quantization, Specializer};
-use crate::components::stage::FullStageToTileReader;
-use crate::components::stage::PartialStageToTileReader;
-use crate::components::{InputIdent, MatmulPrecision, stage};
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
-use cubecl_std::tensor::r#virtual::{ReadWrite, VirtualTensor};
-use cubecl_std::{CubeOption, div_ceil};
+use cubecl_std::tensor::{View, layout::Coords2d};
+use cubecl_std::{CubeOption, CubeOptionExpand};
 use std::marker::PhantomData;
 
 use super::OrderedDoubleBufferingGlobalConfig;
@@ -22,194 +26,225 @@ use super::OrderedDoubleBufferingGlobalConfig;
 /// Performs matrix multiplication at the global level.
 /// Uses double buffering with two shared memory buffers for `Rhs`,
 /// but only one for `Lhs`—the second "buffer" for `Lhs` is the fragments themselves.
-/// For this to work, the `Lhs` loader planes must compute using
+/// For this to work, the `Lhs` reader planes must compute using
 /// only the data they have loaded themselves.
 pub struct OrderedDoubleBufferingMatmul<
     MP: MatmulPrecision,
     SMM: stage::StageMatmul<MP>,
     RL: SyncPartialLoadingStrategy,
+    GW: GlobalWriter<MP::Acc>,
 > {
     _ms: PhantomData<MP>,
     _stage_matmul: PhantomData<SMM>,
     _lhs_loading: PhantomData<LL>,
     _rhs_loading: PhantomData<RL>,
+    _writer: PhantomData<GW>,
 }
 
 #[cube]
-impl<MP: MatmulPrecision, SMM, RL> global::GlobalMatmul<MP>
-    for OrderedDoubleBufferingMatmul<MP, SMM, RL>
+impl<MP: MatmulPrecision, SMM, RL, GW> global::GlobalMatmul<MP>
+    for OrderedDoubleBufferingMatmul<MP, SMM, RL, GW>
 where
     SMM: stage::StageMatmul<
             MP,
-            LhsReader = FullStageToTileReader<
-                MP::ES,
-                <LL as SyncFullLoadingStrategy>::TilingLayout,
-            >,
-            RhsReader = PartialStageToTileReader<MP::ES, RL::TilingLayout>,
+            LhsStage = StridedStage<LhsS<MP>, <LL as SyncFullLoadingStrategy>::TilingLayout>,
+            RhsStage = StridedStage<RhsS<MP>, RL::TilingLayout>,
+            AccStage = FilledStage<AccS<MP>>,
+            OutStage = GW::Stage,
         >,
     RL: SyncPartialLoadingStrategy,
+    GW: GlobalWriter<MP::Acc>,
 {
     type Config = OrderedDoubleBufferingGlobalConfig<SMM::Config>;
-    type LhsLoader = SyncFullLoader<MP, Self::Config, LL>;
-    type RhsLoader = SyncPartialLoader<MP, Self::Config, RL>;
-    type AccumulatorLoader = ZeroAccumulatorLoader;
-    type Writer = SMM::Writer;
-    type Accumulator = SMM::Accumulator;
+    type LhsGlobalReader = SyncFullStageGlobalReader<MP::Lhs, Self::Config, LL>;
+    type RhsGlobalReader = SyncPartialStageGlobalReader<MP::Rhs, Self::Config, RL>;
+    type AccGlobalReader = ZeroGlobalReader<MP::Acc>;
+    type GlobalWriter = GW;
+    type Accumulators = SMM::Accumulators;
 
     fn execute(
-        mut lhs_loader: Self::LhsLoader,
-        mut rhs_loader: Self::RhsLoader,
-        mut out_writer: Self::Writer,
-        acc: &mut Self::Accumulator,
+        mut lhs_reader: Self::LhsGlobalReader,
+        mut rhs_reader: Self::RhsGlobalReader,
+        acc_reader: Self::AccGlobalReader,
+        mut out_writer: Self::GlobalWriter,
+        acc: &mut Self::Accumulators,
         k_range: (u32, u32),
         #[comptime] config: Self::Config,
     ) {
         let stage_step = config.tiling_scheme().elements_in_stage_k();
-        let loop_step = stage_step * 2;
         let range = k_range.1 - k_range.0;
-        let needed_stage_matmuls = div_ceil(range, stage_step);
+        let needed_stage_matmuls = range.div_ceil(stage_step);
 
         // Algorithm assumes an even number of stages
         let num_stage_matmuls = needed_stage_matmuls + (needed_stage_matmuls % 2);
         let num_loops = (num_stage_matmuls - 2) / 2;
 
-        SMM::zero_accumulator(acc, config.stage_config());
+        let acc_reader = acc_reader.stage();
+        SMM::load_accumulators(&acc_reader, acc, config.stage_config());
 
         let (mut lhs_tile, mut rhs_tile) = SMM::init_tile_inputs(config.stage_config());
+        let partition_scheduler = SMM::init_scheduler(config.stage_config());
 
-        let lhs_reader = Self::LhsLoader::reader(&lhs_loader);
-        let rhs_reader_a = Self::RhsLoader::reader(&rhs_loader, StageIdent::A);
-        let rhs_reader_b = Self::RhsLoader::reader(&rhs_loader, StageIdent::B);
+        let lhs_stage = lhs_reader.stage();
+        let rhs_stage_a = rhs_reader.stage(StageBuffer::A);
+        let rhs_stage_b = rhs_reader.stage(StageBuffer::B);
 
         let specializer = Specializer::new::<Self::Config>(config);
 
-        load_first::<MP, SMM, Self::LhsLoader, Self::RhsLoader, Self::Config>(
-            &mut lhs_loader,
-            &mut rhs_loader,
+        read_first::<MP, SMM, Self::LhsGlobalReader, Self::RhsGlobalReader, Self::Config>(
+            &mut lhs_reader,
+            &mut rhs_reader,
             &specializer,
-            StageIdent::A,
+            StageBuffer::A,
             config,
         );
 
-        Self::LhsLoader::advance_view(&mut lhs_loader, stage_step);
+        lhs_reader.advance_view();
 
         sync_cube();
 
         for _ in 0..num_loops {
-            execute_current_and_load_next::<MP, SMM, Self::LhsLoader, Self::RhsLoader, Self::Config>(
-                &lhs_reader,
-                &rhs_reader_a,
+            execute_current_and_read_next::<
+                MP,
+                SMM,
+                Self::LhsGlobalReader,
+                Self::RhsGlobalReader,
+                Self::Config,
+            >(
+                &lhs_stage,
+                &rhs_stage_a,
                 &mut lhs_tile,
                 &mut rhs_tile,
                 acc,
-                &mut lhs_loader,
-                &mut rhs_loader,
+                &mut lhs_reader,
+                &mut rhs_reader,
                 &specializer,
-                StageIdent::B,
+                &partition_scheduler,
+                StageBuffer::B,
                 config,
             );
 
-            Self::LhsLoader::advance_view(&mut lhs_loader, stage_step);
-            Self::RhsLoader::advance_view(&mut rhs_loader, loop_step);
+            lhs_reader.advance_view();
+            rhs_reader.advance_view();
 
             sync_cube();
 
-            execute_current_and_load_next::<MP, SMM, Self::LhsLoader, Self::RhsLoader, Self::Config>(
-                &lhs_reader,
-                &rhs_reader_b,
+            execute_current_and_read_next::<
+                MP,
+                SMM,
+                Self::LhsGlobalReader,
+                Self::RhsGlobalReader,
+                Self::Config,
+            >(
+                &lhs_stage,
+                &rhs_stage_b,
                 &mut lhs_tile,
                 &mut rhs_tile,
                 acc,
-                &mut lhs_loader,
-                &mut rhs_loader,
+                &mut lhs_reader,
+                &mut rhs_reader,
                 &specializer,
-                StageIdent::A,
+                &partition_scheduler,
+                StageBuffer::A,
                 config,
             );
 
-            Self::LhsLoader::advance_view(&mut lhs_loader, stage_step);
+            lhs_reader.advance_view();
 
             sync_cube();
         }
 
-        execute_current_and_load_next::<MP, SMM, Self::LhsLoader, Self::RhsLoader, Self::Config>(
-            &lhs_reader,
-            &rhs_reader_a,
+        execute_current_and_read_next::<
+            MP,
+            SMM,
+            Self::LhsGlobalReader,
+            Self::RhsGlobalReader,
+            Self::Config,
+        >(
+            &lhs_stage,
+            &rhs_stage_a,
             &mut lhs_tile,
             &mut rhs_tile,
             acc,
-            &mut lhs_loader,
-            &mut rhs_loader,
+            &mut lhs_reader,
+            &mut rhs_reader,
             &specializer,
-            StageIdent::B,
+            &partition_scheduler,
+            StageBuffer::B,
             config,
         );
 
         sync_cube();
 
-        execute_last_and_write_results::<MP, SMM, Self::Config>(
-            &lhs_reader,
-            &rhs_reader_b,
+        execute_last_and_write_results::<MP, GW, SMM, Self::Config>(
+            &lhs_stage,
+            &rhs_stage_b,
             &mut lhs_tile,
             &mut rhs_tile,
             acc,
             &mut out_writer,
             &specializer,
+            &partition_scheduler,
             config,
         );
     }
 
-    fn init_lhs_loader(
-        lhs: VirtualTensor<MP::EI>,
-        x_offset: u32,
-        y_offset: u32,
-        _nth_batch: u32,
-        batch_offset: u32,
-        quantization: CubeOption<Quantization<MP>>,
+    fn init_lhs_global_reader(
+        lhs: View<Line<LhsG<MP>>, Coords2d>,
         #[comptime] config: Self::Config,
-    ) -> Self::LhsLoader {
-        SyncFullLoader::<MP, Self::Config, LL>::new(
+    ) -> Self::LhsGlobalReader {
+        let k_step = lhs_k_step::<Self::Config>(config);
+        SyncFullStageGlobalReader::<MP::Lhs, Self::Config, LL>::new(
             lhs,
-            x_offset,
-            y_offset,
-            batch_offset,
-            quantization,
-            InputIdent::Lhs,
+            k_step,
+            MatmulIdent::Lhs,
             config,
         )
     }
 
-    fn init_rhs_loader(
-        rhs: VirtualTensor<MP::EI>,
-        x_offset: u32,
-        y_offset: u32,
-        _nth_batch: u32,
-        batch_offset: u32,
-        quantization: CubeOption<Quantization<MP>>,
+    fn init_rhs_global_reader(
+        rhs: View<Line<RhsG<MP>>, Coords2d>,
         #[comptime] config: Self::Config,
-    ) -> Self::RhsLoader {
-        SyncPartialLoader::<MP, Self::Config, RL>::new(
+    ) -> Self::RhsGlobalReader {
+        let k_step = rhs_k_step::<Self::Config>(config);
+        SyncPartialStageGlobalReader::<MP::Rhs, Self::Config, RL>::new(
             rhs,
-            x_offset,
-            y_offset,
-            batch_offset,
-            quantization,
-            InputIdent::Rhs,
+            k_step,
+            MatmulIdent::Rhs,
             config,
         )
     }
 
-    fn init_writer(
-        out: VirtualTensor<MP::EO, ReadWrite>,
-        x_offset: u32,
-        y_offset: u32,
-        _nth_batch: u32,
-        batch_offset: u32,
-    ) -> Self::Writer {
-        SMM::init_writer(out, x_offset, y_offset, batch_offset)
+    fn init_acc_global_reader(
+        acc: CubeOption<View<Line<AccG<MP>>, Coords2d>>,
+        #[comptime] _config: Self::Config,
+    ) -> Self::AccGlobalReader {
+        match acc {
+            CubeOption::None => ZeroGlobalReader::new(),
+            CubeOption::Some(_) => panic!("Accumulator loading is not yet supported"),
+        }
     }
 
-    fn init_accumulator(#[comptime] config: Self::Config) -> Self::Accumulator {
-        SMM::init_accumulator(config.stage_config())
+    fn init_global_writer(
+        out: View<Line<AccG<MP>>, Coords2d, ReadWrite>,
+        #[comptime] config: Self::Config,
+    ) -> Self::GlobalWriter {
+        let conf = config.global_memory_config(MatmulIdent::Out);
+        Self::GlobalWriter::init::<SMM::Config>(out, conf, config.stage_config())
     }
+
+    fn init_accumulators(#[comptime] config: Self::Config) -> Self::Accumulators {
+        SMM::init_accumulators(config.stage_config())
+    }
+}
+
+#[cube]
+fn lhs_k_step<C: GlobalConfig>(#[comptime] config: C) -> u32 {
+    let step = config.tiling_scheme().elements_in_stage_k();
+    step.runtime()
+}
+#[cube]
+fn rhs_k_step<C: GlobalConfig>(#[comptime] config: C) -> u32 {
+    let step = config.tiling_scheme().elements_in_stage_k() * 2;
+    step.runtime()
 }

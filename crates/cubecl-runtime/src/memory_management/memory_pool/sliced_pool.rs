@@ -1,8 +1,7 @@
-use super::index::SearchIndex;
 use super::{MemoryPool, RingBuffer, Slice, SliceBinding, SliceHandle, SliceId};
-use crate::memory_management::memory_pool::calculate_padding;
-use crate::memory_management::{MemoryUsage, StorageExclude};
+use crate::memory_management::{BytesFormat, MemoryUsage};
 use crate::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
+use crate::{memory_management::memory_pool::calculate_padding, server::IoError};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
@@ -13,13 +12,56 @@ use hashbrown::HashMap;
 pub(crate) struct SlicedPool {
     pages: HashMap<StorageId, MemoryPage>,
     slices: HashMap<SliceId, Slice>,
-    storage_index: SearchIndex<StorageId>,
     ring: RingBuffer,
     recently_added_pages: Vec<StorageId>,
     recently_allocated_size: u64,
     page_size: u64,
     max_alloc_size: u64,
     alignment: u64,
+}
+
+impl core::fmt::Display for SlicedPool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!(
+            " - Sliced Pool page_size={} max_alloc_size={}\n",
+            BytesFormat::new(self.page_size),
+            BytesFormat::new(self.max_alloc_size)
+        ))?;
+
+        for (id, page) in self.pages.iter() {
+            let num_slices = page.slices.len();
+            f.write_fmt(format_args!("   - Page {id} num_slices={num_slices} =>"))?;
+
+            let mut size_free = 0;
+            let mut size_full = 0;
+            let mut size_total = 0;
+
+            for id in page.slices.values() {
+                let slice = self.slices.get(id).unwrap();
+                let is_free = slice.is_free();
+                if is_free {
+                    size_free += slice.effective_size();
+                } else {
+                    size_full += slice.effective_size();
+                }
+                size_total += slice.effective_size();
+            }
+
+            let size_free = BytesFormat::new(size_free);
+            let size_full = BytesFormat::new(size_full);
+            let size_total = BytesFormat::new(size_total);
+
+            f.write_fmt(format_args!(
+                " {size_free} free - {size_full} full - {size_total} total\n"
+            ))?;
+        }
+
+        if !self.pages.is_empty() {
+            f.write_fmt(format_args!("\n{}\n", self.get_memory_usage()))?;
+        }
+
+        Ok(())
+    }
 }
 
 // TODO: consider using generic trait and decouple from Slice
@@ -94,15 +136,12 @@ impl MemoryPool for SlicedPool {
     /// a handle to the reserved memory.
     ///
     /// Also clean ups, merging free slices together if permitted by the merging strategy
-    fn try_reserve(&mut self, size: u64, exclude: Option<&StorageExclude>) -> Option<SliceHandle> {
+    fn try_reserve(&mut self, size: u64) -> Option<SliceHandle> {
         let padding = calculate_padding(size, self.alignment);
         let effective_size = size + padding;
-        let slice_id = self.ring.find_free_slice(
-            effective_size,
-            &mut self.pages,
-            &mut self.slices,
-            exclude,
-        )?;
+        let slice_id =
+            self.ring
+                .find_free_slice(effective_size, &mut self.pages, &mut self.slices)?;
 
         let slice = self.slices.get_mut(&slice_id).unwrap();
         let old_slice_size = slice.effective_size();
@@ -119,8 +158,12 @@ impl MemoryPool for SlicedPool {
         Some(slice.handle.clone())
     }
 
-    fn alloc<Storage: ComputeStorage>(&mut self, storage: &mut Storage, size: u64) -> SliceHandle {
-        let storage_id = self.create_page(storage);
+    fn alloc<Storage: ComputeStorage>(
+        &mut self,
+        storage: &mut Storage,
+        size: u64,
+    ) -> Result<SliceHandle, IoError> {
+        let storage_id = self.create_page(storage)?;
         self.recently_added_pages.push(storage_id);
         self.recently_allocated_size += self.page_size;
 
@@ -150,7 +193,7 @@ impl MemoryPool for SlicedPool {
             page.slices.insert(extra_slice_offset, extra_slice_id);
         }
 
-        handle_slice
+        Ok(handle_slice)
     }
 
     fn get_memory_usage(&self) -> MemoryUsage {
@@ -185,7 +228,6 @@ impl SlicedPool {
         Self {
             pages: HashMap::new(),
             slices: HashMap::new(),
-            storage_index: SearchIndex::new(),
             ring: RingBuffer::new(alignment),
             recently_added_pages: Vec::new(),
             recently_allocated_size: 0,
@@ -216,16 +258,18 @@ impl SlicedPool {
     }
 
     /// Creates a page of given size by allocating on the storage.
-    fn create_page<Storage: ComputeStorage>(&mut self, storage: &mut Storage) -> StorageId {
-        let storage = storage.alloc(self.page_size);
+    fn create_page<Storage: ComputeStorage>(
+        &mut self,
+        storage: &mut Storage,
+    ) -> Result<StorageId, IoError> {
+        let storage = storage.alloc(self.page_size)?;
 
         let id = storage.id;
         self.ring.push_page(id);
 
         self.pages.insert(id, MemoryPage::new(HashMap::new()));
-        self.storage_index.insert(id, self.page_size);
 
-        id
+        Ok(id)
     }
 }
 
@@ -248,7 +292,7 @@ impl Slice {
             size: offset_slice,
         };
 
-        if offset_new % buffer_alignment != 0 {
+        if !offset_new.is_multiple_of(buffer_alignment) {
             panic!("slice with offset {offset_new} needs to be a multiple of {buffer_alignment}");
         }
         let handle = SliceHandle::new();

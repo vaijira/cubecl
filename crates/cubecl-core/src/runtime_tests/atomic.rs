@@ -1,6 +1,8 @@
-use crate::{self as cubecl, AtomicFeature, Feature, ir::Elem};
+use crate::{self as cubecl};
 
 use cubecl::prelude::*;
+use cubecl_ir::StorageType;
+use cubecl_runtime::TypeUsage;
 
 #[cube(launch)]
 pub fn kernel_atomic_add<I: Numeric>(output: &mut Array<Atomic<I>>) {
@@ -11,48 +13,22 @@ pub fn kernel_atomic_add<I: Numeric>(output: &mut Array<Atomic<I>>) {
 
 fn supports_feature<R: Runtime, F: Numeric>(
     client: &ComputeClient<R::Server, R::Channel>,
-    feat: AtomicFeature,
+    feat: TypeUsage,
 ) -> bool {
-    match F::as_elem_native_unchecked() {
-        Elem::Float(kind) => {
-            client
-                .properties()
-                .feature_enabled(Feature::AtomicFloat(feat))
-                && client
-                    .properties()
-                    .feature_enabled(Feature::Type(Elem::AtomicFloat(kind)))
-        }
-        Elem::Int(kind) => {
-            client
-                .properties()
-                .feature_enabled(Feature::AtomicInt(feat))
-                && client
-                    .properties()
-                    .feature_enabled(Feature::Type(Elem::AtomicInt(kind)))
-        }
-        Elem::UInt(kind) => {
-            client
-                .properties()
-                .feature_enabled(Feature::AtomicUInt(feat))
-                && client
-                    .properties()
-                    .feature_enabled(Feature::Type(Elem::AtomicUInt(kind)))
-        }
-        _ => unreachable!(),
-    }
+    let ty = StorageType::Atomic(F::as_type_native_unchecked().elem_type());
+    client.properties().type_usage(ty).contains(feat)
 }
 
 pub fn test_kernel_atomic_add<R: Runtime, F: Numeric + CubeElement>(
     client: ComputeClient<R::Server, R::Channel>,
 ) {
-    if !supports_feature::<R, F>(&client, AtomicFeature::Add) {
+    if !supports_feature::<R, F>(&client, TypeUsage::AtomicAdd) {
         println!(
             "{} Add not supported - skipped",
-            Atomic::<F>::as_elem_native_unchecked()
+            Atomic::<F>::as_type_native_unchecked()
         );
         return;
-    };
-
+    }
     let handle = client.create(F::as_bytes(&[F::from_int(12), F::from_int(1)]));
 
     kernel_atomic_add::launch::<F, R>(
@@ -62,7 +38,7 @@ pub fn test_kernel_atomic_add<R: Runtime, F: Numeric + CubeElement>(
         unsafe { ArrayArg::from_raw_parts::<F>(&handle, 2, 1) },
     );
 
-    let actual = client.read_one(handle.binding());
+    let actual = client.read_one(handle);
     let actual = F::from_bytes(&actual);
 
     assert_eq!(actual[0], F::from_int(17));
@@ -78,14 +54,13 @@ pub fn kernel_atomic_min<I: Numeric>(output: &mut Array<Atomic<I>>) {
 pub fn test_kernel_atomic_min<R: Runtime, F: Numeric + CubeElement>(
     client: ComputeClient<R::Server, R::Channel>,
 ) {
-    if !supports_feature::<R, F>(&client, AtomicFeature::MinMax) {
+    if !supports_feature::<R, F>(&client, TypeUsage::AtomicMinMax) {
         println!(
             "{} Min not supported - skipped",
-            Atomic::<F>::as_elem_native_unchecked()
+            Atomic::<F>::as_type_native_unchecked()
         );
         return;
-    };
-
+    }
     let handle = client.create(F::as_bytes(&[F::from_int(12), F::from_int(1)]));
 
     kernel_atomic_min::launch::<F, R>(
@@ -95,7 +70,7 @@ pub fn test_kernel_atomic_min<R: Runtime, F: Numeric + CubeElement>(
         unsafe { ArrayArg::from_raw_parts::<F>(&handle, 2, 1) },
     );
 
-    let actual = client.read_one(handle.binding());
+    let actual = client.read_one(handle);
     let actual = F::from_bytes(&actual);
 
     assert_eq!(actual[0], F::from_int(5));
@@ -111,14 +86,13 @@ pub fn kernel_atomic_max<I: Numeric>(output: &mut Array<Atomic<I>>) {
 pub fn test_kernel_atomic_max<R: Runtime, F: Numeric + CubeElement>(
     client: ComputeClient<R::Server, R::Channel>,
 ) {
-    if !supports_feature::<R, F>(&client, AtomicFeature::MinMax) {
+    if !supports_feature::<R, F>(&client, TypeUsage::AtomicMinMax) {
         println!(
             "{} Max not supported - skipped",
-            Atomic::<F>::as_elem_native_unchecked()
+            Atomic::<F>::as_type_native_unchecked()
         );
         return;
-    };
-
+    }
     let handle = client.create(F::as_bytes(&[F::from_int(12), F::from_int(1)]));
 
     kernel_atomic_max::launch::<F, R>(
@@ -128,7 +102,7 @@ pub fn test_kernel_atomic_max<R: Runtime, F: Numeric + CubeElement>(
         unsafe { ArrayArg::from_raw_parts::<F>(&handle, 2, 1) },
     );
 
-    let actual = client.read_one(handle.binding());
+    let actual = client.read_one(handle);
     let actual = F::from_bytes(&actual);
 
     assert_eq!(actual[0], F::from_int(12));

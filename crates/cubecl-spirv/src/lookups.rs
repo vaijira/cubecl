@@ -2,15 +2,18 @@ use std::collections::VecDeque;
 
 use cubecl_core::{
     compute::{Binding, Location, Visibility},
-    ir::{self, Id, VariableKind},
+    ir::{self, Id, Type, VariableKind},
     prelude::KernelDefinition,
 };
 use cubecl_opt::{ConstArray, NodeIndex};
 use hashbrown::{HashMap, HashSet};
-use rspirv::spirv::{BuiltIn, CooperativeMatrixLayout, CooperativeMatrixUse, StorageClass, Word};
+use rspirv::{
+    dr,
+    spirv::{self, BuiltIn, CooperativeMatrixLayout, CooperativeMatrixUse, StorageClass, Word},
+};
 
 use crate::{
-    SpirvCompiler, SpirvTarget,
+    MAX_VECTORIZATION, SpirvCompiler, SpirvTarget,
     item::{Elem, Item},
     variable::{ConstVal, Variable},
 };
@@ -18,20 +21,20 @@ use crate::{
 #[derive(Clone, Debug, Default)]
 pub struct LookupTables {
     pub buffers: Vec<Word>,
-    pub scalar_bindings: HashMap<ir::Elem, Word>,
+    pub scalar_bindings: HashMap<ir::StorageType, Word>,
     pub info: Word,
     pub cube_dims: Vec<Word>,
     pub cube_size: Word,
 
     pub const_arrays: Vec<Array>,
-    pub shared_memories: HashMap<Id, Array>,
+    pub shared_memories: HashMap<Id, SharedMemory>,
     pub local_arrays: HashMap<Id, Array>,
     pub matrices: HashMap<Id, Matrix>,
 
     pub used_builtins: HashMap<BuiltIn, (Word, Item)>,
 
-    pub scalars: HashMap<(Id, ir::Elem), Word>,
-    pub array_types: HashMap<Word, Word>,
+    pub scalars: HashMap<(Id, ir::StorageType), Word>,
+    pub array_types: HashSet<Word>,
     pub constants: HashMap<(ConstVal, Item), Word>,
     pub bindings: HashMap<Id, Word>,
     pub variables: HashMap<Id, Word>,
@@ -44,6 +47,8 @@ pub struct LookupTables {
     // For break, continue
     pub loops: VecDeque<Loop>,
 
+    // Explicitly decorated types, to avoid double decorating
+    pub decorated_types: HashSet<Word>,
     pub debug_types: HashSet<Word>,
 }
 
@@ -77,14 +82,29 @@ pub struct Array {
     pub alignment: Option<u32>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SharedMemory {
+    pub id: Word,
+    pub item: Item,
+    pub len: u32,
+    pub align: u32,
+    pub offset: u32,
+}
+
+impl SharedMemory {
+    pub fn end(&self) -> u32 {
+        self.offset + self.len * self.item.size()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(missing_docs)]
 pub struct Matrix {
     pub id: Word,
     pub ident: CooperativeMatrixUse,
-    pub m: u8,
-    pub n: u8,
-    pub k: u8,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
     pub elem: Elem,
     pub layout: Option<CooperativeMatrixLayout>,
 }
@@ -103,9 +123,13 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
         self.state.buffers = kernel
             .buffers
             .into_iter()
-            .map(|binding| {
-                let var =
-                    ir::Variable::new(VariableKind::GlobalInputArray(binding.id), binding.item);
+            .map(|mut binding| {
+                // This is safe when combined with the unroll transform that adjusts all indices.
+                // Must not be used alone
+                if binding.ty.line_size() > MAX_VECTORIZATION {
+                    binding.ty = binding.ty.line(MAX_VECTORIZATION);
+                }
+                let var = ir::Variable::new(VariableKind::GlobalInputArray(binding.id), binding.ty);
                 let name = self.name_of_var(var);
                 target.generate_binding(self, binding, name.into())
             })
@@ -116,7 +140,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             id: offset,
             location: Location::Storage,
             visibility: Visibility::Read,
-            item: ir::Item::new(ir::Elem::UInt(ir::UIntKind::U32)),
+            ty: ir::Type::scalar(ir::ElemType::UInt(ir::UIntKind::U32)),
             size: None,
             has_extended_meta: false,
         };
@@ -130,12 +154,12 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             .into_iter()
             .enumerate()
             .map(|(i, binding)| {
-                let elem = binding.elem;
+                let elem = binding.ty;
                 let binding = Binding {
                     id: i as u32 + offset,
                     location: Location::Storage,
                     visibility: Visibility::Read,
-                    item: ir::Item::new(elem),
+                    ty: ir::Type::new(elem),
                     size: Some(binding.count),
                     has_extended_meta: false,
                 };
@@ -147,12 +171,66 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
         let cube_dims = [kernel.cube_dim.x, kernel.cube_dim.y, kernel.cube_dim.z];
         self.state.cube_dims = cube_dims.iter().map(|dim| self.const_u32(*dim)).collect();
         self.state.cube_size = self.const_u32(cube_dims.iter().product());
+
+        let shared_liveness = self.shared_liveness.clone();
+        let shared_memories = shared_liveness.allocations.values().map(|alloc| {
+            let smem_id = self.id();
+            let smem = SharedMemory {
+                id: smem_id,
+                item: self.compile_type(alloc.smem.ty),
+                len: alloc.smem.length,
+                align: alloc.smem.align,
+                offset: alloc.offset,
+            };
+            (alloc.smem.id, smem)
+        });
+        self.state.shared_memories = shared_memories.collect();
+    }
+
+    fn dedup_const(&mut self, inst: &dr::Instruction) -> Option<Word> {
+        self.module_ref()
+            .types_global_values
+            .iter()
+            .find(|it| {
+                it.class == inst.class
+                    && it.result_type == inst.result_type
+                    && it.operands == inst.operands
+            })
+            .and_then(|it| it.result_id)
+    }
+
+    pub fn dedup_constant_bit32(&mut self, ty: Word, val: u32) -> Word {
+        let inst = dr::Instruction::new(
+            spirv::Op::Constant,
+            Some(ty),
+            None,
+            vec![dr::Operand::LiteralBit32(val)],
+        );
+        if let Some(id) = self.dedup_const(&inst) {
+            id
+        } else {
+            self.constant_bit32(ty, val)
+        }
+    }
+
+    pub fn dedup_constant_bit64(&mut self, ty: Word, val: u64) -> Word {
+        let inst = dr::Instruction::new(
+            spirv::Op::Constant,
+            Some(ty),
+            None,
+            vec![dr::Operand::LiteralBit64(val)],
+        );
+        if let Some(id) = self.dedup_const(&inst) {
+            id
+        } else {
+            self.constant_bit64(ty, val)
+        }
     }
 
     pub fn const_u32(&mut self, value: u32) -> Word {
         let ty = Item::Scalar(Elem::Int(32, false));
         let ty_id = ty.id(self);
-        self.constant_bit32(ty_id, value)
+        self.dedup_constant_bit32(ty_id, value)
     }
 
     pub fn insert_global(&mut self, insert: impl FnOnce(&mut Self) -> Word) -> Word {
@@ -226,17 +304,17 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
         }
     }
 
-    pub fn global_scalar(&mut self, id: Id, elem: ir::Elem) -> Variable {
-        if let Some(existing) = self.state.scalars.get(&(id, elem)).copied() {
-            let item = self.compile_item(ir::Item::new(elem));
+    pub fn global_scalar(&mut self, id: Id, ty: ir::StorageType) -> Variable {
+        if let Some(existing) = self.state.scalars.get(&(id, ty)).copied() {
+            let item = self.compile_type(ir::Type::new(ty));
             Variable::GlobalScalar(existing, item.elem())
         } else {
-            let ir_var = ir::Variable::new(VariableKind::GlobalScalar(id), elem.into());
+            let ir_var = ir::Variable::new(VariableKind::GlobalScalar(id), Type::new(ty));
             let current_block = self.selected_block();
             let setup = self.setup_block;
             self.select_block(Some(setup)).unwrap();
-            let arr_id = self.state.scalar_bindings[&elem];
-            let item = self.compile_item(ir::Item::new(elem));
+            let arr_id = self.state.scalar_bindings[&ty];
+            let item = self.compile_type(ir::Type::new(ty));
             let arr = Variable::GlobalInputArray(arr_id, item.clone(), 0);
             let const_id = self.const_u32(id);
             let index = Variable::ConstantScalar(const_id, id.into(), Elem::Int(32, false));
@@ -245,7 +323,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             self.debug_var_name(read_id, ir_var);
             self.read_indexed_unchecked(&var, &arr, &index);
             self.select_block(current_block).unwrap();
-            self.state.scalars.insert((id, elem), read_id);
+            self.state.scalars.insert((id, ty), read_id);
             var
         }
     }
@@ -255,10 +333,11 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             VariableKind::ConstantArray {
                 id: arr.id,
                 length: arr.length,
+                unroll_factor: 1,
             },
             arr.item,
         );
-        let item = self.compile_item(arr.item);
+        let item = self.compile_type(arr.item);
         let array_ty = Item::Array(Box::new(item.clone()), arr.length);
         let pointer_ty = Item::Pointer(StorageClass::Function, Box::new(array_ty.clone())).id(self);
         let array_ty = array_ty.id(self);

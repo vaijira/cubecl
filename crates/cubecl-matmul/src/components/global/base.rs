@@ -1,22 +1,22 @@
 use cubecl_core::prelude::*;
 use cubecl_core::{self as cubecl};
 
-use crate::components::error::MatmulSetupError;
-use crate::components::global::RoleRuleConfig;
+use crate::components::global::memory::GlobalMemoryConfig;
+use crate::components::{AccG, error::MatmulSetupError};
 use crate::components::{
-    AvailableLineSizes, Ident, InputIdent, MatmulPrecision, MatmulProblem, MatrixLayout,
-    TilingScheme,
+    AvailableLineSizes, MatmulPrecision, MatmulProblem, MatrixLayout, TilingScheme,
     global::{PlaneRoleConfig, SpecializedLoadingSides, multi_stage::EventLoadingMode},
-    stage::{self, StageConfig},
+    stage::StageConfig,
 };
-use crate::components::{MatmulLineSizes, MatmulSelection};
+use crate::components::{LhsG, MatmulIdent, MatmulLineSizes, MatmulSelection, RhsG};
+use crate::components::{global::RoleRuleConfig, stage::StageMemoryConfig};
 use cubecl_std::{
     CubeOption,
-    tensor::r#virtual::{ReadWrite, VirtualTensor},
+    tensor::{View, layout::Coords2d},
 };
 use std::{fmt::Debug, hash::Hash};
 
-use super::{GlobalWriter, Quantization, load::LoaderMode};
+use super::read::ReaderMode;
 
 /// A family of [matmuls](GlobalMatmul) working with any [precision](MatmulPrecision).
 pub trait GlobalMatmulFamily: Send + Sync + 'static {
@@ -61,64 +61,65 @@ pub trait GlobalMatmulFamily: Send + Sync + 'static {
 /// # Safety
 ///
 /// It is not assumed that the matmul's dimensions match its inputs dimensions perfectly.
-/// It is therefore important that Loaders and Writers perform checks to avoid out-of-bounds
-/// before loading data.
+/// It is therefore important that Readers and Writers perform checks to avoid out-of-bounds
+/// before reading data.
 pub trait GlobalMatmul<MP: MatmulPrecision>: 'static + Send + Sync {
     type Config: GlobalConfig;
-    type LhsLoader: CubeType;
-    type RhsLoader: CubeType;
-    type AccumulatorLoader: CubeType;
-    type Writer: GlobalWriter<MP::EO>;
-    type Accumulator: CubeType;
+
+    /// Global reader for matrix A (Lhs)
+    type LhsGlobalReader: CubeType;
+    /// Global reader for matrix B (Rhs)
+    type RhsGlobalReader: CubeType;
+    /// Global reader for matrix C (Accumulator/Bias)
+    type AccGlobalReader: CubeType;
+    /// Writer to store the output stage into global memory
+    type GlobalWriter: CubeType;
+
+    /// The accumulator type for the tile matmul
+    type Accumulators: CubeType;
 
     /// Performs the matrix multiplication over data loaded by the
-    /// Lhs and Rhs loaders, over the range given for K, and stores with
+    /// Lhs and Rhs readers, over the range given for K, and stores with
     /// using the output writer.
     ///
     /// To compute the whole range of k values, use k_range=(0, K) where
     /// K is the K dimension of Lhs and Rhs.
     fn execute(
-        lhs_loader: Self::LhsLoader,
-        rhs_loader: Self::RhsLoader,
-        writer: Self::Writer,
-        acc: &mut Self::Accumulator,
+        lhs_reader: Self::LhsGlobalReader,
+        rhs_reader: Self::RhsGlobalReader,
+        acc_reader: Self::AccGlobalReader,
+        writer: Self::GlobalWriter,
+        acc: &mut Self::Accumulators,
         k_range: (u32, u32),
         #[comptime] config: Self::Config,
     );
 
-    /// Initialize the loader for Lhs, starting at row m and column k
-    fn init_lhs_loader(
-        lhs: VirtualTensor<MP::EI>,
-        m_offset: u32,
-        k_offset: u32,
-        nth_batch: u32,
-        batch_offset: u32,
-        quantization: CubeOption<Quantization<MP>>,
+    /// Initialize the global reader for Lhs, starting at row m and column k
+    fn init_lhs_global_reader(
+        lhs: View<Line<LhsG<MP>>, Coords2d>,
         #[comptime] config: Self::Config,
-    ) -> Self::LhsLoader;
+    ) -> Self::LhsGlobalReader;
 
-    /// Initialize the loader for Rhs, starting at row k and column n
-    fn init_rhs_loader(
-        rhs: VirtualTensor<MP::EI>,
-        k_offset: u32,
-        n_offset: u32,
-        nth_batch: u32,
-        batch_offset: u32,
-        quantization: CubeOption<Quantization<MP>>,
+    /// Initialize the global reader for Rhs, starting at row k and column n
+    fn init_rhs_global_reader(
+        rhs: View<Line<RhsG<MP>>, Coords2d>,
         #[comptime] config: Self::Config,
-    ) -> Self::RhsLoader;
+    ) -> Self::RhsGlobalReader;
+
+    /// Initialize the global reader for Rhs, starting at row k and column n
+    fn init_acc_global_reader(
+        acc: CubeOption<View<Line<AccG<MP>>, Coords2d>>,
+        #[comptime] config: Self::Config,
+    ) -> Self::AccGlobalReader;
 
     /// Initialize the accumulator without data
-    fn init_accumulator(#[comptime] config: Self::Config) -> Self::Accumulator;
+    fn init_accumulators(#[comptime] config: Self::Config) -> Self::Accumulators;
 
-    /// Initialize the writer at row m and column n
-    fn init_writer(
-        out: VirtualTensor<MP::EO, ReadWrite>,
-        m_offset: u32,
-        n_offset: u32,
-        nth_batch: u32,
-        batch_offset: u32,
-    ) -> Self::Writer;
+    /// Initialize the global writer at row m and column n
+    fn init_global_writer(
+        out: View<Line<AccG<MP>>, Coords2d, ReadWrite>,
+        #[comptime] config: Self::Config,
+    ) -> Self::GlobalWriter;
 }
 
 /// Configuration for the [global matmul](GlobalMatmul) level.
@@ -126,13 +127,30 @@ pub trait GlobalConfig:
     Copy + Clone + Eq + PartialEq + Hash + Debug + Send + Sync + 'static
 {
     /// Underlying Stage matmul config
-    type StageConfig: stage::StageConfig;
+    type StageConfig: StageConfig;
 
     /// Convert itself to the underlying stage matmul config
     fn stage_config(&self) -> Self::StageConfig;
 
+    fn stage_memory_config(&self, ident: MatmulIdent) -> StageMemoryConfig {
+        self.stage_config().stage_memory_config(ident.into_stage())
+    }
+
+    fn global_memory_config(&self, ident: MatmulIdent) -> GlobalMemoryConfig {
+        GlobalMemoryConfig {
+            elements_in_tile_row: self.tiling_scheme().elements_in_tile_row(ident),
+            elements_in_tile_col: self.tiling_scheme().elements_in_tile_col(ident),
+            elements_in_stage_row: self.tiling_scheme().elements_in_stage_row(ident),
+            elements_in_stage_col: self.tiling_scheme().elements_in_stage_col(ident),
+            global_line_size: self.global_line_size(ident),
+            check_row_bounds: self.check_row_bounds(ident),
+            check_col_bounds: self.check_col_bounds(ident),
+            matrix_layout: self.matrix_layout(ident),
+        }
+    }
+
     /// Returns the line size for the global memory corresponding to the given ident
-    fn global_line_size<I: Into<Ident>>(&self, ident: I) -> u32;
+    fn global_line_size(&self, ident: MatmulIdent) -> u32;
 
     /// Returns the [TilingScheme]
     fn tiling_scheme(&self) -> TilingScheme {
@@ -140,10 +158,10 @@ pub trait GlobalConfig:
     }
 
     /// Returns the [MatrixLayout] for the given ident
-    fn matrix_layout<I: Into<Ident>>(&self, ident: I) -> MatrixLayout;
+    fn matrix_layout(&self, ident: MatmulIdent) -> MatrixLayout;
 
     /// Returns the number of planes participating in loading `ident`
-    fn num_loading_planes<I: Into<Ident>>(&self, ident: I) -> u32;
+    fn num_loading_planes(&self, ident: MatmulIdent) -> u32;
 
     /// Indicates the specialization roles for the planes
     fn plane_role_config(&self) -> PlaneRoleConfig;
@@ -160,10 +178,10 @@ pub trait GlobalConfig:
     fn plane_dim(&self) -> u32;
 
     /// Whether to check if accessing a row would exceed bounds.
-    fn check_row_bounds<I: Into<Ident>>(&self, ident: I) -> bool;
+    fn check_row_bounds(&self, ident: MatmulIdent) -> bool;
 
     /// Whether to check if accessing a col would exceed bounds.
-    fn check_col_bounds<I: Into<Ident>>(&self, ident: I) -> bool;
+    fn check_col_bounds(&self, ident: MatmulIdent) -> bool;
 
     /// Whether to check if accessing a col for lhs or row for rhs would exceed bounds.
     fn check_k_bounds(&self) -> bool;
@@ -172,15 +190,15 @@ pub trait GlobalConfig:
     fn precompute_job(&self) -> bool;
 
     /// The number of stages in stage memory
-    fn num_stages(&self, ident: InputIdent) -> u32;
+    fn num_stages(&self, ident: MatmulIdent) -> u32;
 
-    /// Whether to check loader is balanced in comptime or runtime.
+    /// Whether to check reader is balanced in comptime or runtime.
     ///
     /// Not supported by all loading strategies
-    fn loader_mode(&self) -> LoaderMode;
+    fn reader_mode(&self) -> ReaderMode;
 
     /// Whether event loading is constrained to be ordered
-    fn event_loading_mode(&self, ident: InputIdent) -> EventLoadingMode;
+    fn event_loading_mode(&self, ident: MatmulIdent) -> EventLoadingMode;
 
     /// Whether the matmul is quantized
     fn quantized(&self) -> bool {

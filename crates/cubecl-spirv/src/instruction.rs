@@ -42,6 +42,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
             Operation::NonSemantic(debug) => self.compile_debug(debug),
             Operation::Barrier(_) => panic!("Barrier not supported in SPIR-V"),
             Operation::Tma(_) => panic!("TMA not supported in SPIR-V"),
+            Operation::Free(_) => {}
         }
     }
 
@@ -53,7 +54,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     match lhs_ty.elem() {
                         Elem::Bool => b.logical_equal(ty, Some(out), lhs, rhs),
                         Elem::Int(_, _) => b.i_equal(ty, Some(out), lhs, rhs),
-                        Elem::Float(_) => b.f_ord_equal(ty, Some(out), lhs, rhs),
+                        Elem::Float(..) => b.f_ord_equal(ty, Some(out), lhs, rhs),
                         Elem::Relaxed => {
                             b.decorate(out, Decoration::RelaxedPrecision, []);
                             b.f_ord_equal(ty, Some(out), lhs, rhs)
@@ -68,7 +69,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     match lhs_ty.elem() {
                         Elem::Bool => b.logical_not_equal(ty, Some(out), lhs, rhs),
                         Elem::Int(_, _) => b.i_not_equal(ty, Some(out), lhs, rhs),
-                        Elem::Float(_) => b.f_ord_not_equal(ty, Some(out), lhs, rhs),
+                        Elem::Float(..) => b.f_ord_not_equal(ty, Some(out), lhs, rhs),
                         Elem::Relaxed => {
                             b.decorate(out, Decoration::RelaxedPrecision, []);
                             b.f_ord_not_equal(ty, Some(out), lhs, rhs)
@@ -83,7 +84,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     match lhs_ty.elem() {
                         Elem::Int(_, false) => b.u_less_than(ty, Some(out), lhs, rhs),
                         Elem::Int(_, true) => b.s_less_than(ty, Some(out), lhs, rhs),
-                        Elem::Float(_) => b.f_ord_less_than(ty, Some(out), lhs, rhs),
+                        Elem::Float(..) => b.f_ord_less_than(ty, Some(out), lhs, rhs),
                         Elem::Relaxed => {
                             b.decorate(out, Decoration::RelaxedPrecision, []);
                             b.f_ord_less_than(ty, Some(out), lhs, rhs)
@@ -98,7 +99,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     match lhs_ty.elem() {
                         Elem::Int(_, false) => b.u_less_than_equal(ty, Some(out), lhs, rhs),
                         Elem::Int(_, true) => b.s_less_than_equal(ty, Some(out), lhs, rhs),
-                        Elem::Float(_) => b.f_ord_less_than_equal(ty, Some(out), lhs, rhs),
+                        Elem::Float(..) => b.f_ord_less_than_equal(ty, Some(out), lhs, rhs),
                         Elem::Relaxed => {
                             b.decorate(out, Decoration::RelaxedPrecision, []);
                             b.f_ord_less_than_equal(ty, Some(out), lhs, rhs)
@@ -113,7 +114,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     match lhs_ty.elem() {
                         Elem::Int(_, false) => b.u_greater_than(ty, Some(out), lhs, rhs),
                         Elem::Int(_, true) => b.s_greater_than(ty, Some(out), lhs, rhs),
-                        Elem::Float(_) => b.f_ord_greater_than(ty, Some(out), lhs, rhs),
+                        Elem::Float(..) => b.f_ord_greater_than(ty, Some(out), lhs, rhs),
                         Elem::Relaxed => {
                             b.decorate(out, Decoration::RelaxedPrecision, []);
                             b.f_ord_greater_than(ty, Some(out), lhs, rhs)
@@ -128,7 +129,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     match lhs_ty.elem() {
                         Elem::Int(_, false) => b.u_greater_than_equal(ty, Some(out), lhs, rhs),
                         Elem::Int(_, true) => b.s_greater_than_equal(ty, Some(out), lhs, rhs),
-                        Elem::Float(_) => b.f_ord_greater_than_equal(ty, Some(out), lhs, rhs),
+                        Elem::Float(..) => b.f_ord_greater_than_equal(ty, Some(out), lhs, rhs),
                         Elem::Relaxed => {
                             b.decorate(out, Decoration::RelaxedPrecision, []);
                             b.f_ord_greater_than_equal(ty, Some(out), lhs, rhs)
@@ -138,6 +139,16 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     .unwrap();
                 });
             }
+            Comparison::IsNan(op) => {
+                self.compile_unary_op(op, out, uniform, |b, _, ty, input, out| {
+                    b.is_nan(ty, Some(out), input).unwrap();
+                });
+            }
+            Comparison::IsInf(op) => {
+                self.compile_unary_op(op, out, uniform, |b, _, ty, input, out| {
+                    b.is_inf(ty, Some(out), input).unwrap();
+                });
+            }
         }
     }
 
@@ -145,7 +156,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
         let out = out.unwrap();
         match op {
             Operator::Index(op) | Operator::UncheckedIndex(op) => {
-                let is_atomic = op.list.item.elem.is_atomic();
+                let is_atomic = op.list.ty.is_atomic();
                 let value = self.compile_variable(op.list);
                 let index = self.compile_variable(op.index);
                 let out = self.compile_variable(out);
@@ -219,7 +230,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                     .into_iter()
                     .map(|it| self.read(&it))
                     .collect::<Vec<_>>();
-                let item = self.compile_item(out.item);
+                let item = self.compile_type(out.ty);
                 let out = self.compile_variable(out);
                 let out_id = self.write_id(&out);
                 self.mark_uniformity(out_id, uniform);
@@ -244,7 +255,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                 let in_index = self.compile_variable(op.in_index);
                 let out = self.compile_variable(out);
                 let out_index = self.compile_variable(op.out_index);
-                let len = op.len.as_const().unwrap().as_u32();
+                let len = op.len;
 
                 let source = self.index_ptr(&input, &in_index);
                 let target = self.index_ptr(&out, &out_index);
@@ -375,16 +386,17 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
         let lhs = self.compile_variable(op.lhs);
         let rhs = self.compile_variable(op.rhs);
         let out = self.compile_variable(out);
-        let lhs_ty = lhs.item();
 
-        let lhs_id = self.read(&lhs);
-        let rhs_id = self.read_as(&rhs, &lhs_ty);
+        let in_ty = out.item().same_vectorization(lhs.elem());
+
+        let lhs_id = self.read_as(&lhs, &in_ty);
+        let rhs_id = self.read_as(&rhs, &in_ty);
         let out_id = self.write_id(&out);
         self.mark_uniformity(out_id, uniform);
 
         let ty = out.item().id(self);
 
-        exec(self, lhs_ty, ty, lhs_id, rhs_id, out_id);
+        exec(self, in_ty, ty, lhs_id, rhs_id, out_id);
         self.write(&out, out_id);
     }
 

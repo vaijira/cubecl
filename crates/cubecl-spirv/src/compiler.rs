@@ -1,7 +1,17 @@
 use cubecl_common::ExecutionMode;
-use cubecl_core::{Metadata, WgpuCompilationOptions, ir as core, prelude::FastMath};
-use cubecl_opt::{BasicBlock, NodeIndex, Optimizer, OptimizerBuilder, Uniformity};
-use cubecl_runtime::config::{GlobalConfig, compilation::CompilationLogLevel};
+use cubecl_core::{
+    Metadata, WgpuCompilationOptions, ir as core,
+    post_processing::{
+        checked_io::CheckedIoProcessor, saturating::SaturatingArithmeticProcessor,
+        unroll::UnrollProcessor,
+    },
+    prelude::FastMath,
+};
+use cubecl_opt::{BasicBlock, NodeIndex, Optimizer, OptimizerBuilder, SharedLiveness, Uniformity};
+use cubecl_runtime::{
+    EnumSet,
+    config::{GlobalConfig, compilation::CompilationLogLevel},
+};
 use std::{
     collections::HashSet,
     fmt::Debug,
@@ -12,7 +22,7 @@ use std::{
 
 use cubecl_core::{Compiler, compute::KernelDefinition};
 use rspirv::{
-    dr::{self, Builder, InsertPoint, Instruction, Module, Operand},
+    dr::{Builder, InsertPoint, Instruction, Module, Operand},
     spirv::{self, BuiltIn, Capability, Decoration, FPFastMathMode, Op, StorageClass, Word},
 };
 
@@ -24,6 +34,8 @@ use crate::{
     target::{GLCompute, SpirvTarget},
     transformers::{BitwiseTransform, ErfTransform},
 };
+
+pub const MAX_VECTORIZATION: u32 = 4;
 
 pub struct SpirvCompiler<Target: SpirvTarget = GLCompute> {
     pub target: Target,
@@ -37,6 +49,7 @@ pub struct SpirvCompiler<Target: SpirvTarget = GLCompute> {
     pub setup_block: usize,
     pub opt: Rc<Optimizer>,
     pub uniformity: Rc<Uniformity>,
+    pub shared_liveness: Rc<SharedLiveness>,
     pub current_block: Option<NodeIndex>,
     pub visited: HashSet<NodeIndex>,
 
@@ -46,7 +59,7 @@ pub struct SpirvCompiler<Target: SpirvTarget = GLCompute> {
     pub ext_meta_pos: Vec<u32>,
     pub metadata: Metadata,
     pub debug_info: Option<DebugInfo>,
-    compilation_options: WgpuCompilationOptions,
+    pub compilation_options: WgpuCompilationOptions,
 }
 
 unsafe impl<T: SpirvTarget> Send for SpirvCompiler<T> {}
@@ -63,10 +76,11 @@ impl<T: SpirvTarget> Clone for SpirvCompiler<T> {
             setup_block: self.setup_block,
             opt: self.opt.clone(),
             uniformity: self.uniformity.clone(),
+            shared_liveness: self.shared_liveness.clone(),
             current_block: self.current_block,
 
             capabilities: self.capabilities.clone(),
-            float_controls: false,
+            float_controls: self.float_controls,
             state: self.state.clone(),
             debug_symbols: self.debug_symbols,
             fp_math_mode: self.fp_math_mode,
@@ -100,6 +114,7 @@ impl<T: SpirvTarget> Default for SpirvCompiler<T> {
             setup_block: Default::default(),
             opt: Default::default(),
             uniformity: Default::default(),
+            shared_liveness: Default::default(),
             current_block: Default::default(),
             debug_symbols: debug_symbols_activated(),
             fp_math_mode: FPFastMathMode::NONE,
@@ -140,7 +155,7 @@ impl<T: SpirvTarget> Compiler for SpirvCompiler<T> {
         let scalars = value
             .scalars
             .iter()
-            .map(|s| (self.compile_elem(s.elem), s.count))
+            .map(|s| (self.compile_storage_type(s.ty), s.count))
             .collect();
         let mut ext_meta_pos = Vec::new();
         let mut num_ext = 0;
@@ -148,8 +163,8 @@ impl<T: SpirvTarget> Compiler for SpirvCompiler<T> {
         let mut all_meta: Vec<_> = value
             .buffers
             .iter()
+            .chain(value.tensor_maps.iter())
             .map(|buf| (buf.id, buf.has_extended_meta))
-            .chain(value.tensor_maps.iter().map(|id| (*id, true)))
             .collect();
         all_meta.sort_by_key(|(id, _)| *id);
 
@@ -177,7 +192,7 @@ impl<T: SpirvTarget> Compiler for SpirvCompiler<T> {
         }
     }
 
-    fn elem_size(&self, elem: core::Elem) -> usize {
+    fn elem_size(&self, elem: core::ElemType) -> usize {
         elem.size()
     }
 
@@ -201,31 +216,29 @@ impl<Target: SpirvTarget> SpirvCompiler<Target> {
             true => convert_math_mode(options.fp_math_mode),
             false => FPFastMathMode::NONE,
         };
+        self.float_controls = self.fp_math_mode != FPFastMathMode::NONE;
 
-        if self.fp_math_mode != FPFastMathMode::NONE {
-            let inst = dr::Instruction::new(
-                spirv::Op::Capability,
-                None,
-                None,
-                vec![dr::Operand::LiteralBit32(6029)],
-            );
-            self.module_mut().capabilities.push(inst);
+        if self.float_controls {
+            self.capabilities.insert(Capability::FloatControls2);
         }
 
         self.set_version(1, 6);
 
         let mut target = self.target.clone();
 
-        self.init_state(kernel.clone());
-
         let mut opt = OptimizerBuilder::default()
             .with_transformer(ErfTransform)
             .with_transformer(BitwiseTransform)
-            .optimize(kernel.body, kernel.cube_dim, self.mode);
+            .with_processor(CheckedIoProcessor::new(self.mode))
+            .with_processor(UnrollProcessor::new(MAX_VECTORIZATION))
+            .with_processor(SaturatingArithmeticProcessor::new(true))
+            .optimize(kernel.body.clone(), kernel.cube_dim);
 
         self.uniformity = opt.analysis::<Uniformity>();
+        self.shared_liveness = opt.analysis::<SharedLiveness>();
         self.opt = Rc::new(opt);
 
+        self.init_state(kernel.clone());
         self.init_debug();
 
         let cube_dims = vec![kernel.cube_dim.x, kernel.cube_dim.y, kernel.cube_dim.z];
@@ -369,12 +382,81 @@ impl<Target: SpirvTarget> SpirvCompiler<Target> {
     }
 
     fn declare_shared_memories(&mut self) {
+        if self.compilation_options.supports_explicit_smem {
+            self.declare_shared_memories_explicit();
+        } else {
+            self.declare_shared_memories_implicit();
+        }
+    }
+
+    /// When using `VK_KHR_workgroup_memory_explicit_layout`, all shared memory is declared as a
+    /// `Block`. This means they are all pointers into the same chunk of memory, with different
+    /// offsets and sizes. Unlike C++, this shared block is declared implicitly, not explicitly.
+    /// Alignment and total size is calculated by the driver.
+    fn declare_shared_memories_explicit(&mut self) {
         let shared_memories = self.state.shared_memories.clone();
-        for (_, memory) in shared_memories {
+        if shared_memories.is_empty() {
+            return;
+        }
+
+        self.capabilities
+            .insert(Capability::WorkgroupMemoryExplicitLayoutKHR);
+
+        for (index, memory) in shared_memories {
+            let item_size = memory.item.size();
+
+            // It's safe to assume that if 8-bit/16-bit types are supported, they're supported for
+            // explicit layout as well.
+            match item_size {
+                1 => {
+                    self.capabilities
+                        .insert(Capability::WorkgroupMemoryExplicitLayout8BitAccessKHR);
+                }
+                2 => {
+                    self.capabilities
+                        .insert(Capability::WorkgroupMemoryExplicitLayout16BitAccessKHR);
+                }
+                _ => {}
+            }
+
+            let arr_ty = Item::Array(Box::new(memory.item), memory.len);
+            let arr_id = arr_ty.id(self);
+
+            if !self.state.decorated_types.contains(&arr_id) {
+                self.decorate(
+                    arr_id,
+                    Decoration::ArrayStride,
+                    [Operand::LiteralBit32(item_size)],
+                );
+                self.state.decorated_types.insert(arr_id);
+            }
+
+            let block_ty = Item::Struct(vec![arr_ty]);
+            let block_id = block_ty.id(self);
+
+            self.decorate(block_id, Decoration::Block, []);
+            self.member_decorate(
+                block_id,
+                0,
+                Decoration::Offset,
+                [Operand::LiteralBit32(memory.offset)],
+            );
+
+            let ptr_ty = Item::Pointer(StorageClass::Workgroup, Box::new(block_ty)).id(self);
+
+            self.debug_shared(memory.id, index);
+            self.variable(ptr_ty, Some(memory.id), StorageClass::Workgroup, None);
+            self.decorate(memory.id, Decoration::Aliased, []);
+        }
+    }
+
+    fn declare_shared_memories_implicit(&mut self) {
+        let shared_memories = self.state.shared_memories.clone();
+        for (index, memory) in shared_memories {
             let arr_ty = Item::Array(Box::new(memory.item), memory.len);
             let ptr_ty = Item::Pointer(StorageClass::Workgroup, Box::new(arr_ty)).id(self);
 
-            self.debug_var_name(memory.id, memory.var);
+            self.debug_shared(memory.id, index);
             self.variable(ptr_ty, Some(memory.id), StorageClass::Workgroup, None);
         }
     }
@@ -389,15 +471,7 @@ impl<Target: SpirvTarget> SpirvCompiler<Target> {
             .map(|it| it.result_id.expect("OpTypeFloat always has result ID"))
             .collect::<Vec<_>>();
         for ty in scalars {
-            let operands = vec![
-                dr::Operand::IdRef(main),
-                dr::Operand::LiteralBit32(6028),
-                dr::Operand::LiteralBit32(ty),
-                dr::Operand::LiteralBit32(mode),
-            ];
-
-            let inst = dr::Instruction::new(spirv::Op::ExecutionModeId, None, None, operands);
-            self.module_mut().execution_modes.push(inst);
+            self.execution_mode(main, spirv::ExecutionMode::FPFastMathDefault, [ty, mode]);
         }
     }
 
@@ -407,7 +481,7 @@ impl<Target: SpirvTarget> SpirvCompiler<Target> {
     }
 }
 
-fn convert_math_mode(math_mode: FastMath) -> FPFastMathMode {
+fn convert_math_mode(math_mode: EnumSet<FastMath>) -> FPFastMathMode {
     let mut flags = FPFastMathMode::NONE;
 
     for mode in math_mode.iter() {

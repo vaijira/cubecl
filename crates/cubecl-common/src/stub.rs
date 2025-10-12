@@ -1,13 +1,20 @@
 #[cfg(not(feature = "std"))]
-use spin::{
-    Mutex as MutexImported, MutexGuard, Once as OnceImported, RwLock as RwLockImported,
-    RwLockReadGuard, RwLockWriteGuard,
-};
+use spin::{Mutex as MutexImported, MutexGuard, Once as OnceImported, RwLock as RwLockImported};
 #[cfg(feature = "std")]
 use std::sync::{
     Mutex as MutexImported, MutexGuard, OnceLock as OnceImported, RwLock as RwLockImported,
-    RwLockReadGuard, RwLockWriteGuard,
 };
+
+#[cfg(not(feature = "std"))]
+pub use spin::{RwLockReadGuard, RwLockWriteGuard};
+#[cfg(feature = "std")]
+pub use std::sync::{RwLockReadGuard, RwLockWriteGuard};
+
+#[cfg(target_has_atomic = "ptr")]
+pub use alloc::sync::Arc;
+
+#[cfg(not(target_has_atomic = "ptr"))]
+pub use portable_atomic_util::Arc;
 
 /// A mutual exclusion primitive useful for protecting shared data
 ///
@@ -31,7 +38,7 @@ impl<T> Mutex<T> {
 
     /// Locks the mutex blocking the current thread until it is able to do so.
     #[inline(always)]
-    pub fn lock(&self) -> Result<MutexGuard<T>, alloc::string::String> {
+    pub fn lock(&self) -> Result<MutexGuard<'_, T>, alloc::string::String> {
         #[cfg(not(feature = "std"))]
         {
             Ok(self.inner.lock())
@@ -65,7 +72,7 @@ impl<T> RwLock<T> {
     /// Locks this rwlock with shared read access, blocking the current thread
     /// until it can be acquired.
     #[inline(always)]
-    pub fn read(&self) -> Result<RwLockReadGuard<T>, alloc::string::String> {
+    pub fn read(&self) -> Result<RwLockReadGuard<'_, T>, alloc::string::String> {
         #[cfg(not(feature = "std"))]
         {
             Ok(self.inner.read())
@@ -79,7 +86,7 @@ impl<T> RwLock<T> {
     /// Locks this rwlock with exclusive write access, blocking the current thread
     /// until it can be acquired.
     #[inline(always)]
-    pub fn write(&self) -> Result<RwLockWriteGuard<T>, alloc::string::String> {
+    pub fn write(&self) -> Result<RwLockWriteGuard<'_, T>, alloc::string::String> {
         #[cfg(not(feature = "std"))]
         {
             Ok(self.inner.write())

@@ -2,8 +2,9 @@ use std::marker::PhantomData;
 
 use cubecl::prelude::*;
 use cubecl_core::{self as cubecl, unexpanded};
-use cubecl_std::tensor::r#virtual::{
-    ReadWrite, VirtualTensor, VirtualTensorOperations, VirtualTensorOperationsExpand,
+use cubecl_std::{
+    CubeOption, CubeOptionExpand,
+    tensor::r#virtual::{VirtualTensor, VirtualTensorOperations, VirtualTensorOperationsExpand},
 };
 
 pub trait ReduceDType {
@@ -49,6 +50,9 @@ pub trait ReduceArgs: Send + Sync + 'static + Clone {
 
     fn stride_input<P: ReduceDType>(state: &Self::State<P>, dim: u32) -> u32;
     fn stride_output<P: ReduceDType>(state: &Self::State<P>, dim: u32) -> u32;
+
+    fn line_size_input<P: ReduceDType>(state: &Self::State<P>) -> comptime_type!(u32);
+    fn line_size_output<P: ReduceDType>(state: &Self::State<P>) -> comptime_type!(u32);
 }
 
 #[cube]
@@ -133,6 +137,14 @@ impl ReduceArgs for TensorArgs {
 
     fn stride_output<P: ReduceDType>(state: &Self::State<P>, dim: u32) -> u32 {
         unsafe { (*state.1).stride(dim) }
+    }
+
+    fn line_size_input<P: ReduceDType>(state: &Self::State<P>) -> comptime_type!(u32) {
+        unsafe { (*state.0).line_size() }
+    }
+
+    fn line_size_output<P: ReduceDType>(state: &Self::State<P>) -> comptime_type!(u32) {
+        unsafe { (*state.1).line_size() }
     }
 }
 
@@ -239,9 +251,17 @@ impl<P: ReduceDType, RA: ReduceArgs> VirtualTensorOperationsExpand<P::In>
 
     fn __expand_as_tensor_map_method(
         &self,
-        _scope: &mut Scope,
-    ) -> ExpandElementTyped<TensorMap<P::In>> {
-        todo!()
+        scope: &mut Scope,
+    ) -> CubeOptionExpand<TensorMap<P::In>> {
+        CubeOption::__expand_new_None(scope)
+    }
+}
+
+impl<P: ReduceDType, RA: ReduceArgs> Lined for TensorArg<P, RA, Input> {}
+impl<P: ReduceDType, RA: ReduceArgs> LinedExpand for TensorArgExpand<P, RA, Input> {
+    fn line_size(&self) -> u32 {
+        let mut scope = Scope::root(false);
+        RA::__expand_line_size_input(&mut scope, self.state.clone())
     }
 }
 
@@ -303,9 +323,17 @@ impl<P: ReduceDType, RA: ReduceArgs> VirtualTensorOperationsExpand<P::Out>
 
     fn __expand_as_tensor_map_method(
         &self,
-        _scope: &mut Scope,
-    ) -> ExpandElementTyped<TensorMap<P::Out>> {
-        todo!()
+        scope: &mut Scope,
+    ) -> CubeOptionExpand<TensorMap<P::Out>> {
+        CubeOption::__expand_new_None(scope)
+    }
+}
+
+impl<P: ReduceDType, RA: ReduceArgs> Lined for TensorArg<P, RA, Output> {}
+impl<P: ReduceDType, RA: ReduceArgs> LinedExpand for TensorArgExpand<P, RA, Output> {
+    fn line_size(&self) -> u32 {
+        let mut scope = Scope::root(false);
+        RA::__expand_line_size_output(&mut scope, self.state.clone())
     }
 }
 

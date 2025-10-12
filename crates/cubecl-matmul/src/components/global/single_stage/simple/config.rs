@@ -1,15 +1,15 @@
 use cubecl_core::{CubeDim, Runtime, client::ComputeClient};
 
 use crate::components::{
-    Ident, InputIdent, LoadingPrecomputeStrategy, MatmulPrecision, MatrixLayout,
+    LoadingPrecomputeStrategy, MatmulIdent, MatmulPrecision, MatrixLayout,
     error::MatmulSetupError,
     global::{
         self, LoadingSides, PlaneRoleConfig, SpecializedLoadingSides,
-        load::{LoaderMode, LoadingValidation},
         multi_stage::EventLoadingMode,
+        read::{LoadingValidation, ReaderMode},
         shared::shared_global_config_validation,
     },
-    stage,
+    stage::{self, StageMemoryConfig},
 };
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -22,41 +22,45 @@ pub struct SimpleConfig<S: stage::StageConfig> {
     check_k_bounds: bool,
     pub k_step: u32,
     precompute_job: LoadingPrecomputeStrategy,
-    loader_mode: LoaderMode,
+    reader_mode: ReaderMode,
 }
 
 impl<S: stage::StageConfig> global::GlobalConfig for SimpleConfig<S> {
     type StageConfig = S;
 
+    fn stage_memory_config(&self, ident: MatmulIdent) -> StageMemoryConfig {
+        self.stage_config.stage_memory_config(ident.into_stage())
+    }
+
     fn stage_config(&self) -> Self::StageConfig {
         self.stage_config
     }
 
-    fn global_line_size<I: Into<Ident>>(&self, ident: I) -> u32 {
-        self.stage_config.global_line_size(ident)
+    fn global_line_size(&self, ident: MatmulIdent) -> u32 {
+        self.stage_config.global_line_size(ident.into_stage())
     }
 
-    fn matrix_layout<I: Into<Ident>>(&self, ident: I) -> MatrixLayout {
-        self.stage_config.matrix_layout(ident)
+    fn matrix_layout(&self, ident: MatmulIdent) -> MatrixLayout {
+        self.stage_config.matrix_layout(ident.into_stage())
     }
 
     fn plane_dim(&self) -> u32 {
         self.stage_config.plane_dim()
     }
 
-    fn check_row_bounds<I: Into<Ident>>(&self, ident: I) -> bool {
-        match ident.into() {
-            Ident::Lhs => self.check_m_bounds,
-            Ident::Rhs => self.check_k_bounds,
-            Ident::Out => self.check_m_bounds,
+    fn check_row_bounds(&self, ident: MatmulIdent) -> bool {
+        match ident {
+            MatmulIdent::Lhs => self.check_m_bounds,
+            MatmulIdent::Rhs => self.check_k_bounds,
+            MatmulIdent::Out => self.check_m_bounds,
         }
     }
 
-    fn check_col_bounds<I: Into<Ident>>(&self, ident: I) -> bool {
-        match ident.into() {
-            Ident::Lhs => self.check_k_bounds,
-            Ident::Rhs => self.check_n_bounds,
-            Ident::Out => self.check_n_bounds,
+    fn check_col_bounds(&self, ident: MatmulIdent) -> bool {
+        match ident {
+            MatmulIdent::Lhs => self.check_k_bounds,
+            MatmulIdent::Rhs => self.check_n_bounds,
+            MatmulIdent::Out => self.check_n_bounds,
         }
     }
 
@@ -64,7 +68,7 @@ impl<S: stage::StageConfig> global::GlobalConfig for SimpleConfig<S> {
         self.check_k_bounds
     }
 
-    fn num_stages(&self, _ident: InputIdent) -> u32 {
+    fn num_stages(&self, _ident: MatmulIdent) -> u32 {
         1
     }
 
@@ -72,11 +76,11 @@ impl<S: stage::StageConfig> global::GlobalConfig for SimpleConfig<S> {
         self.precompute_job.into()
     }
 
-    fn loader_mode(&self) -> LoaderMode {
-        self.loader_mode
+    fn reader_mode(&self) -> ReaderMode {
+        self.reader_mode
     }
 
-    fn event_loading_mode(&self, _ident: InputIdent) -> EventLoadingMode {
+    fn event_loading_mode(&self, _ident: MatmulIdent) -> EventLoadingMode {
         EventLoadingMode::Relaxed
     }
 
@@ -84,7 +88,7 @@ impl<S: stage::StageConfig> global::GlobalConfig for SimpleConfig<S> {
         self.stage_config.plane_role_config()
     }
 
-    fn num_loading_planes<I: Into<Ident>>(&self, _ident: I) -> u32 {
+    fn num_loading_planes(&self, _ident: MatmulIdent) -> u32 {
         // Specialized is not available
         self.stage_config().num_main_flow_planes()
     }
@@ -107,7 +111,7 @@ impl<S: stage::StageConfig> SimpleConfig<S> {
     /// Create a new config for simple global matmul
     ///
     /// May return an error if:
-    /// - a loader is invalid
+    /// - a reader is invalid
     /// - CubeDim is too big
     /// - Barriers are not available
     pub fn new<LL: LoadingValidation, RL: LoadingValidation, MP: MatmulPrecision, R: Runtime>(
@@ -119,7 +123,7 @@ impl<S: stage::StageConfig> SimpleConfig<S> {
         check_k_bounds: bool,
         k_step: u32,
         precompute_job: LoadingPrecomputeStrategy,
-        loader_mode: LoaderMode,
+        reader_mode: ReaderMode,
     ) -> Result<Self, MatmulSetupError> {
         Self {
             stage_config,
@@ -129,7 +133,7 @@ impl<S: stage::StageConfig> SimpleConfig<S> {
             check_k_bounds,
             k_step,
             precompute_job,
-            loader_mode,
+            reader_mode,
         }
         .validate::<LL, RL>()
     }
@@ -137,8 +141,8 @@ impl<S: stage::StageConfig> SimpleConfig<S> {
     fn validate<LL: LoadingValidation, RL: LoadingValidation>(
         self,
     ) -> Result<Self, MatmulSetupError> {
-        LL::check(&self, Ident::Lhs)?;
-        RL::check(&self, Ident::Rhs)?;
+        LL::check(&self, MatmulIdent::Lhs)?;
+        RL::check(&self, MatmulIdent::Rhs)?;
         shared_global_config_validation(self)?;
 
         Ok(self)

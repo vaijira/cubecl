@@ -1,18 +1,18 @@
-use cubecl_ir::ExpandElement;
+use cubecl_ir::{ExpandElement, StorageType};
 
 use crate::Runtime;
 use crate::frontend::{CubeType, Numeric};
-use crate::ir::{Elem, IntKind, Scope};
+use crate::ir::{ElemType, IntKind, Scope};
 use crate::prelude::BitwiseNot;
-use crate::prelude::{FindFirstSet, LeadingZeros};
+use crate::prelude::{FindFirstSet, LeadingZeros, SaturatingAdd, SaturatingSub};
 use crate::{
-    compute::{KernelBuilder, KernelLauncher},
+    compute::KernelLauncher,
     prelude::{CountOnes, ReverseBits},
 };
 
 use super::{
     __expand_new, CubePrimitive, ExpandElementIntoMut, ExpandElementTyped, IntoMut, IntoRuntime,
-    LaunchArgExpand, ScalarArgSettings, into_mut_expand_element, into_runtime_expand_element,
+    ScalarArgSettings, into_mut_expand_element, into_runtime_expand_element,
 };
 
 mod typemap;
@@ -26,6 +26,8 @@ pub trait Int:
     + BitwiseNot
     + LeadingZeros
     + FindFirstSet
+    + SaturatingAdd
+    + SaturatingSub
     + std::ops::Rem<Output = Self>
     + core::ops::Add<Output = Self>
     + core::ops::Sub<Output = Self>
@@ -65,8 +67,8 @@ macro_rules! impl_int {
         }
 
         impl CubePrimitive for $type {
-            fn as_elem_native() -> Option<Elem> {
-                Some(Elem::Int(IntKind::$kind))
+            fn as_type_native() -> Option<StorageType> {
+                Some(ElemType::Int(IntKind::$kind).into())
             }
         }
 
@@ -103,17 +105,6 @@ macro_rules! impl_int {
 
             fn new(val: i64) -> Self {
                 val as $type
-            }
-        }
-
-        impl LaunchArgExpand for $type {
-            type CompilationArg = ();
-
-            fn expand(
-                _: &Self::CompilationArg,
-                builder: &mut KernelBuilder,
-            ) -> ExpandElementTyped<Self> {
-                builder.scalar($type::as_elem(&builder.scope)).into()
             }
         }
     };

@@ -1,15 +1,15 @@
 use crate::components::{
-    AvailableLineSizes, InputRuntimeArg, MatmulLineSizes, MatmulPrecision, MatmulProblem,
-    MatmulSelection, MatmulSpec, OutputRuntimeArg, TilingScheme,
+    AccG, AvailableLineSizes, InputRuntimeArg, LhsG, MatmulLineSizes, MatmulPrecision,
+    MatmulProblem, MatmulSelection, MatmulSpec, OutputRuntimeArg, RhsG, TilingScheme,
     batch::{CubeCountInput, CubeCountInputArgs, HypercubeConfig},
     error::MatmulSetupError,
-    global::{self, GlobalConfig as _, Quantization},
+    global::{self, GlobalConfig as _},
 };
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 use cubecl_std::{
     CubeOption,
-    tensor::r#virtual::{ReadWrite, VirtualTensor},
+    tensor::{View, layout::Coords3d},
 };
 use std::{fmt::Debug, hash::Hash};
 
@@ -77,10 +77,10 @@ pub trait BatchMatmul<MP: MatmulPrecision>: 'static + Send + Sync {
 
     /// Performs batchwise matrix multiplication over tensors.
     fn execute(
-        lhs: VirtualTensor<MP::EI>,
-        rhs: VirtualTensor<MP::EI>,
-        out: VirtualTensor<MP::EO, ReadWrite>,
-        quantization: CubeOption<Quantization<MP>>,
+        a: View<Line<LhsG<MP>>, Coords3d>,
+        b: View<Line<RhsG<MP>>, Coords3d>,
+        c: CubeOption<View<Line<AccG<MP>>, Coords3d>>,
+        out: View<Line<AccG<MP>>, Coords3d, ReadWrite>,
         cube_count_args: CubeCountInput,
         #[comptime] config: Self::Config,
     );
@@ -95,9 +95,6 @@ pub trait BatchConfig:
 
     /// Convert itself to the underlying global matmul config
     fn global_config(&self) -> Self::GlobalConfig;
-
-    /// Returns true if the matmul is quantized.
-    fn quantized(&self) -> bool;
 
     /// Returns the [TilingScheme]
     fn tiling_scheme(&self) -> TilingScheme {

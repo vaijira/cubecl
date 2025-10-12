@@ -1,9 +1,18 @@
 use core::fmt::Debug;
 
-use crate::{server::Binding, storage_id_type};
+use crate::{
+    server::{Binding, IoError},
+    storage_id_type,
+};
 
 // This ID is used to map a handle to its actual data.
 storage_id_type!(StorageId);
+
+impl core::fmt::Display for StorageId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!("StorageId({})", self.value))
+    }
+}
 
 /// Defines if data uses a full memory chunk or a slice of it.
 #[derive(Clone, Debug)]
@@ -25,11 +34,15 @@ pub struct StorageHandle {
 
 impl StorageHandle {
     /// Returns the size the handle is pointing to in memory.
+    ///
+    /// # Notes
+    ///
+    /// The result considers the offset.
     pub fn size(&self) -> u64 {
         self.utilization.size
     }
 
-    /// Returns the size the handle is pointing to in memory.
+    /// Returns the offset of the handle.
     pub fn offset(&self) -> u64 {
         self.utilization.offset
     }
@@ -74,12 +87,15 @@ pub trait ComputeStorage: Send {
     fn get(&mut self, handle: &StorageHandle) -> Self::Resource;
 
     /// Allocates `size` units of memory and returns a handle to it
-    fn alloc(&mut self, size: u64) -> StorageHandle;
+    fn alloc(&mut self, size: u64) -> Result<StorageHandle, IoError>;
 
     /// Deallocates the memory pointed by the given storage id.
     ///
-    /// These deallocations might need to be flushed with [`Self::perform_deallocations`].
+    /// These deallocations might need to be flushed with [`Self::flush`].
     fn dealloc(&mut self, id: StorageId);
+
+    /// Flush deallocations when required.
+    fn flush(&mut self) {}
 }
 
 /// Access to the underlying resource for a given binding.
@@ -95,9 +111,9 @@ pub struct BindingResource<Resource: Send> {
 
 impl<Resource: Send> BindingResource<Resource> {
     /// access the underlying resource. Note: The resource might be bigger
-    /// than just the original allocation for the binding. Only the part
-    /// for the original binding is guaranteed to remain, other parts
-    /// of the resource *will* be re-used.
+    /// than the part required by the binding (e.g. a big buffer where the binding only
+    /// refers to a slice of it). Only the part required by the binding is guaranteed to remain,
+    /// other parts of this resource *will* be re-used.
     pub fn resource(&self) -> &Resource {
         &self.resource
     }

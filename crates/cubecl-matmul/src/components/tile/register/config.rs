@@ -1,30 +1,31 @@
-use cubecl_core::Runtime;
 use cubecl_core::client::ComputeClient;
-use cubecl_core::ir::{Elem, FloatKind};
+use cubecl_core::ir::{ElemType, FloatKind};
+use cubecl_core::prelude::Numeric;
+use cubecl_core::{Runtime, ir::StorageType};
+use cubecl_runtime::TypeUsage;
 
 use crate::components::error::{MatmulAvailabilityError, MatmulSetupError};
 use crate::components::tile::TileConfig;
-use crate::components::{Ident, MatmulPrecision, MatrixLayout, TileSize, TilingScheme};
-use cubecl_core::frontend::CubePrimitive;
+use crate::components::{MatrixLayout, StageIdent, TileSize};
 
 /// Execution mode for the RegisterMatmul
 pub enum ProductType {
     /// Computes the Tile Matmul as m*n inner products of length k.
     ///
     /// Needs Lhs to be row major and Rhs to be col major
-    /// If not the case, tile will be transposed during fill
+    /// If not the case, tile will be transposed during load
     Inner,
     /// Computes the Stage Matmul as the sum of k outer products of size m*n.
     ///
     /// Needs Lhs to be col major and Rhs to be row major
-    /// If not the case, tile will be transposed during fill
+    /// If not the case, tile will be transposed during load
     Outer,
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 /// Configuration for Register Matmul
 pub struct RegisterConfig {
-    tiling_scheme: TilingScheme,
+    pub tile_size: TileSize,
     plane_dim: u32,
     lhs_layout: MatrixLayout,
     rhs_layout: MatrixLayout,
@@ -40,32 +41,35 @@ impl TileConfig for RegisterConfig {
         self.plane_dim
     }
 
-    fn matrix_layout<I: Into<Ident>>(&self, ident: I) -> MatrixLayout {
-        match ident.into() {
-            Ident::Lhs => self.lhs_layout,
-            Ident::Rhs => self.rhs_layout,
-            Ident::Out => MatrixLayout::RowMajor,
+    fn matrix_layout(&self, ident: StageIdent) -> MatrixLayout {
+        match ident {
+            StageIdent::Lhs => self.lhs_layout,
+            StageIdent::Rhs => self.rhs_layout,
+            StageIdent::Acc => MatrixLayout::RowMajor,
+            StageIdent::Out => MatrixLayout::RowMajor,
         }
     }
 
-    fn stage_line_size<I: Into<Ident>>(&self, ident: I) -> u32 {
-        match ident.into() {
-            Ident::Lhs => self.lhs_stage_line_size,
-            Ident::Rhs => self.rhs_stage_line_size,
-            Ident::Out => self.out_global_line_size,
+    fn stage_line_size(&self, ident: StageIdent) -> u32 {
+        match ident {
+            StageIdent::Lhs => self.lhs_stage_line_size,
+            StageIdent::Rhs => self.rhs_stage_line_size,
+            StageIdent::Acc => self.out_global_line_size,
+            StageIdent::Out => self.out_global_line_size,
         }
     }
 
-    fn global_line_size<I: Into<Ident>>(&self, ident: I) -> u32 {
-        match ident.into() {
-            Ident::Lhs => self.lhs_global_line_size,
-            Ident::Rhs => self.rhs_global_line_size,
-            Ident::Out => self.out_global_line_size,
+    fn global_line_size(&self, ident: StageIdent) -> u32 {
+        match ident {
+            StageIdent::Lhs => self.lhs_global_line_size,
+            StageIdent::Rhs => self.rhs_global_line_size,
+            StageIdent::Acc => self.out_global_line_size,
+            StageIdent::Out => self.out_global_line_size,
         }
     }
 
     fn tile_size(&self) -> &TileSize {
-        &self.tiling_scheme.tile_size
+        &self.tile_size
     }
 }
 
@@ -76,9 +80,9 @@ impl RegisterConfig {
     /// May return an error if:
     /// - Line sizes do not evenly divide tile sizes in the lined axis
     /// - Types are unavailable
-    pub fn new<MP: MatmulPrecision, R: Runtime>(
+    pub fn new<Lhs: Numeric, Rhs: Numeric, Acc: Numeric, R: Runtime>(
         client: &ComputeClient<R::Server, R::Channel>,
-        tiling_scheme: TilingScheme,
+        tile_size: TileSize,
         plane_dim: u32,
         lhs_layout: MatrixLayout,
         rhs_layout: MatrixLayout,
@@ -89,7 +93,7 @@ impl RegisterConfig {
         rhs_stage_line_size: u32,
     ) -> Result<Self, MatmulSetupError> {
         Self {
-            tiling_scheme,
+            tile_size,
             plane_dim,
             lhs_layout,
             rhs_layout,
@@ -100,7 +104,7 @@ impl RegisterConfig {
             rhs_stage_line_size,
         }
         .validate()?
-        .check_availability::<MP, R>(client)
+        .check_availability::<Lhs, Rhs, Acc, R>(client)
     }
 
     pub fn product_type(&self) -> ProductType {
@@ -113,36 +117,36 @@ impl RegisterConfig {
         let n = self.tile_size().n();
         let k = self.tile_size().k();
 
-        let lhs = self.stage_line_size(Ident::Lhs);
-        let rhs = self.stage_line_size(Ident::Rhs);
-        let out = self.global_line_size(Ident::Out);
+        let lhs = self.lhs_stage_line_size;
+        let rhs = self.rhs_stage_line_size;
+        let out = self.out_global_line_size;
 
-        match self.matrix_layout(Ident::Lhs) {
+        match self.matrix_layout(StageIdent::Lhs) {
             MatrixLayout::RowMajor => {
-                if k % lhs != 0 {
+                if !k.is_multiple_of(lhs) {
                     return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
                         "Tile shape in lined axis {k:?} should be divisible by line size {lhs:?}"
                     ))));
                 }
             }
             MatrixLayout::ColMajor => {
-                if m % lhs != 0 {
+                if !m.is_multiple_of(lhs) {
                     return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
                         "Tile shape in lined axis {m:?} should be divisible by line size {lhs:?}"
                     ))));
                 }
             }
         }
-        match self.matrix_layout(Ident::Rhs) {
+        match self.matrix_layout(StageIdent::Rhs) {
             MatrixLayout::RowMajor => {
-                if n % rhs != 0 {
+                if !n.is_multiple_of(rhs) {
                     return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
                         "Tile shape in lined axis {n:?} should be divisible by line size {rhs:?}"
                     ))));
                 }
             }
             MatrixLayout::ColMajor => {
-                if k % rhs != 0 {
+                if !k.is_multiple_of(rhs) {
                     return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
                         "Tile shape in lined axis {k:?} should be divisible by line size {rhs:?}"
                     ))));
@@ -150,7 +154,7 @@ impl RegisterConfig {
             }
         }
 
-        if n % out != 0 {
+        if !n.is_multiple_of(out) {
             return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
                 "Tile shape in lined axis {n:?} should be divisible by line size {out:?}"
             ))));
@@ -159,29 +163,40 @@ impl RegisterConfig {
         Ok(self)
     }
 
-    fn check_availability<MP: MatmulPrecision, R: Runtime>(
+    fn check_availability<Lhs: Numeric, Rhs: Numeric, Acc: Numeric, R: Runtime>(
         self,
         client: &ComputeClient<R::Server, R::Channel>,
     ) -> Result<Self, MatmulSetupError> {
-        let es = MP::ES::as_elem_native().expect("to be a native type");
-        let ea = MP::EA::as_elem_native().expect("to be a native type");
+        let lhs = Lhs::as_type_native_unchecked();
+        let rhs = Rhs::as_type_native_unchecked();
+        let acc = Acc::as_type_native_unchecked();
 
-        let es = match es {
-            Elem::Float(FloatKind::Flex32) => Elem::Float(FloatKind::F32),
-            _ => es,
+        let lhs = match lhs {
+            StorageType::Scalar(ElemType::Float(FloatKind::Flex32)) => {
+                ElemType::Float(FloatKind::F32).into()
+            }
+            _ => lhs,
+        };
+        let rhs = match rhs {
+            StorageType::Scalar(ElemType::Float(FloatKind::Flex32)) => {
+                ElemType::Float(FloatKind::F32).into()
+            }
+            _ => rhs,
         };
 
-        let ea = match ea {
-            Elem::Float(FloatKind::Flex32) => Elem::Float(FloatKind::F32),
-            _ => ea,
+        let output = match acc {
+            StorageType::Scalar(ElemType::Float(FloatKind::Flex32)) => {
+                ElemType::Float(FloatKind::F32).into()
+            }
+            _ => acc,
         };
 
-        if !(MP::ES::is_supported(client) && MP::EA::is_supported(client)) {
+        if !(Lhs::supported_uses(client).contains(TypeUsage::Arithmetic)
+            && Rhs::supported_uses(client).contains(TypeUsage::Arithmetic)
+            && Acc::supported_uses(client).contains(TypeUsage::Arithmetic))
+        {
             return Err(MatmulSetupError::Unavailable(
-                MatmulAvailabilityError::TypesUnavailable {
-                    input: es,
-                    output: ea,
-                },
+                MatmulAvailabilityError::TypesUnavailable { lhs, rhs, output },
             ));
         }
 

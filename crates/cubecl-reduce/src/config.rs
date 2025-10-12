@@ -7,7 +7,6 @@ use cubecl_std::tensor::is_contiguous;
 use crate::ReduceStrategy;
 
 // TODO: Should we allows the user to change that?
-const DEFAULT_CUBE_DIM: CubeDim = CubeDim::new_2d(32, 8);
 const DEFAULT_PLANE_COUNT: u32 = 8;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -87,8 +86,8 @@ impl ReduceConfig {
         output: &TensorHandleRef<R>,
         axis: usize,
     ) -> Self {
-        let elem = In::as_elem_native_unchecked();
-        let supported_line_sizes = R::line_size_elem(&elem);
+        let elem = In::as_type_native_unchecked();
+        let supported_line_sizes = R::io_optimized_line_sizes_unchecked(&elem);
         self.line_size_input = match self.line_mode {
             LineMode::Parallel => {
                 tensor_line_size_parallel(supported_line_sizes, input.shape, input.strides, axis)
@@ -161,7 +160,7 @@ impl ReduceConfig {
                     && output.strides[rank - 1] == 1;
             let shape = output.shape.get(axis + 1).cloned().unwrap_or(1) as u32;
 
-            if is_contiguous && shape % self.line_size_input == 0 {
+            if is_contiguous && shape.is_multiple_of(self.line_size_input) {
                 self.line_size_output = self.line_size_input;
             }
         }
@@ -177,7 +176,8 @@ impl ReduceConfig {
             let plane_dim = client.properties().hardware.plane_size_min;
             CubeDim::new_2d(plane_dim, DEFAULT_PLANE_COUNT)
         } else {
-            DEFAULT_CUBE_DIM
+            let plane_dim = client.properties().hardware.plane_size_max;
+            CubeDim::new_2d(plane_dim, DEFAULT_PLANE_COUNT)
         };
         self
     }

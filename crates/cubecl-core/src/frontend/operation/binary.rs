@@ -8,6 +8,7 @@ use crate::{
     frontend::operation::base::{binary_expand, binary_expand_fixed_output},
     unexpanded,
 };
+use cubecl_common::{e2m1, e4m3, e5m2, ue8m0};
 use half::{bf16, f16};
 
 pub mod add {
@@ -156,66 +157,93 @@ pub mod shr {
 
 /// For binary functions without special syntax
 macro_rules! impl_binary_func {
-    ($trait_name:ident, $method_name:ident, $func_name_expand:ident, $method_name_expand:ident, $operator:expr, $($type:ty),*) => {
-        pub trait $trait_name: CubeType + Sized {
-            fn $method_name(self, _rhs: Self) -> Self {
-                unexpanded!()
+    ($trait_name:ident, $method_name:ident, $operator:expr, $($type:ty),*) => {
+        paste::paste! {
+            pub trait $trait_name: CubeType + Sized {
+                fn $method_name(self, _rhs: Self) -> Self {
+                    unexpanded!()
+                }
+
+                fn [<__expand_ $method_name>](
+                    scope: &mut Scope,
+                    lhs: ExpandElementTyped<Self>,
+                    rhs: ExpandElementTyped<Self>,
+                ) -> ExpandElementTyped<Self> {
+                    binary_expand(scope, lhs.into(), rhs.into(), $operator).into()
+                }
             }
 
-            fn $func_name_expand(
-                scope: &mut Scope,
-                lhs: ExpandElementTyped<Self>,
-                rhs: ExpandElementTyped<Self>,
-            ) -> ExpandElementTyped<Self> {
-                binary_expand(scope, lhs.into(), rhs.into(), $operator).into()
-            }
+            $(impl $trait_name for $type {})*
+            $(impl ExpandElementTyped<$type> {
+                pub fn [<__expand_ $method_name _method>](self, scope: &mut Scope, rhs: ExpandElementTyped<$type>) -> ExpandElementTyped<$type> {
+                    binary_expand(scope, self.into(), rhs.into(), $operator).into()
+                }
+            })*
         }
-
-        $(impl $trait_name for $type {})*
-        $(impl ExpandElementTyped<$type> {
-            pub fn $method_name_expand(self, scope: &mut Scope, rhs: ExpandElementTyped<$type>) -> ExpandElementTyped<$type> {
-                binary_expand(scope, self.into(), rhs.into(), $operator).into()
-            }
-        })*
     }
 }
 
 macro_rules! impl_binary_func_fixed_output_vectorization {
-    ($trait_name:ident, $method_name:ident, $func_name_expand:ident, $method_name_expand:ident, $operator:expr, $out_vectorization: expr, $($type:ty),*) => {
-        pub trait $trait_name: CubeType + Sized {
-            fn $method_name(self, _rhs: Self) -> Self {
-                unexpanded!()
+    ($trait_name:ident, $method_name:ident, $operator:expr, $out_vectorization: expr, $($type:ty),*) => {
+        paste::paste! {
+            pub trait $trait_name: CubeType + Sized {
+                fn $method_name(self, _rhs: Self) -> Self {
+                    unexpanded!()
+                }
+
+                fn [<__expand_ $method_name>](
+                    scope: &mut Scope,
+                    lhs: ExpandElementTyped<Self>,
+                    rhs: ExpandElementTyped<Self>,
+                ) -> ExpandElementTyped<Self> {
+                    let lhs: ExpandElement = lhs.into();
+                    let item = lhs.ty.line($out_vectorization);
+                    binary_expand_fixed_output(scope, lhs, rhs.into(), item, $operator).into()
+                }
             }
 
-            fn $func_name_expand(
-                scope: &mut Scope,
-                lhs: ExpandElementTyped<Self>,
-                rhs: ExpandElementTyped<Self>,
-            ) -> ExpandElementTyped<Self> {
-                let lhs: ExpandElement = lhs.into();
-                let mut item = lhs.item;
-                item.vectorization = $out_vectorization;
-                binary_expand_fixed_output(scope, lhs, rhs.into(), item, $operator).into()
-            }
+            $(impl $trait_name for $type {})*
+            $(impl ExpandElementTyped<$type> {
+                pub fn [<__expand_ $method_name _method>](self, scope: &mut Scope, rhs: ExpandElementTyped<$type>) -> ExpandElementTyped<$type> {
+                    let lhs: ExpandElement = self.into();
+                    let item = lhs.ty.line($out_vectorization);
+                    binary_expand_fixed_output(scope, lhs, rhs.into(), item, $operator).into()
+                }
+            })*
         }
+    }
+}
 
-        $(impl $trait_name for $type {})*
-        $(impl ExpandElementTyped<$type> {
-            pub fn $method_name_expand(self, scope: &mut Scope, rhs: ExpandElementTyped<$type>) -> ExpandElementTyped<$type> {
-                let lhs: ExpandElement = self.into();
-                let mut item = lhs.item;
-                item.vectorization = $out_vectorization;
-                binary_expand_fixed_output(scope, lhs, rhs.into(), item, $operator).into()
+macro_rules! impl_binary_func_mixed_types {
+    ($trait_name:ident, $method_name:ident, $rhs_ty: ident, $operator:expr, $($type:ty),*) => {
+        paste::paste! {
+            pub trait $trait_name<Rhs: CubeType + Sized>: CubeType + Sized {
+                fn $method_name(self, _rhs: Rhs) -> Self {
+                    unexpanded!()
+                }
+
+                fn [<__expand_ $method_name>](
+                    scope: &mut Scope,
+                    lhs: ExpandElementTyped<Self>,
+                    rhs: ExpandElementTyped<Rhs>,
+                ) -> ExpandElementTyped<Self> {
+                    binary_expand(scope, lhs.into(), rhs.into(), $operator).into()
+                }
             }
-        })*
+
+            $(impl $trait_name<$rhs_ty> for $type {})*
+            $(impl ExpandElementTyped<$type> {
+                pub fn [<__expand_ $method_name _method>](self, scope: &mut Scope, rhs: ExpandElementTyped<$rhs_ty>) -> ExpandElementTyped<$type> {
+                    binary_expand(scope, self.into(), rhs.into(), $operator).into()
+                }
+            })*
+        }
     }
 }
 
 impl_binary_func!(
     Powf,
     powf,
-    __expand_powf,
-    __expand_powf_method,
     Arithmetic::Powf,
     f16,
     bf16,
@@ -227,9 +255,11 @@ impl_binary_func!(
 impl_binary_func!(
     Max,
     max,
-    __expand_max,
-    __expand_max_method,
     Arithmetic::Max,
+    e2m1,
+    e4m3,
+    e5m2,
+    ue8m0,
     f16,
     bf16,
     flex32,
@@ -248,9 +278,11 @@ impl_binary_func!(
 impl_binary_func!(
     Min,
     min,
-    __expand_min,
-    __expand_min_method,
     Arithmetic::Min,
+    e2m1,
+    e4m3,
+    e5m2,
+    ue8m0,
     f16,
     bf16,
     flex32,
@@ -269,9 +301,11 @@ impl_binary_func!(
 impl_binary_func!(
     Remainder,
     rem,
-    __expand_rem,
-    __expand_rem_method,
     Arithmetic::Remainder,
+    e2m1,
+    e4m3,
+    e5m2,
+    ue8m0,
     f16,
     bf16,
     flex32,
@@ -287,22 +321,59 @@ impl_binary_func!(
     u32,
     u64
 );
+impl_binary_func!(MulHi, mul_hi, Arithmetic::MulHi, i32, u32);
 impl_binary_func!(
-    MulHi,
-    mul_hi,
-    __expand_mul_hi,
-    __expand_mul_hi_method,
-    Arithmetic::MulHi,
+    SaturatingAdd,
+    saturating_add,
+    Arithmetic::SaturatingAdd,
+    i8,
+    i16,
     i32,
-    u32
+    i64,
+    u8,
+    u16,
+    u32,
+    u64
+);
+impl_binary_func!(
+    SaturatingSub,
+    saturating_sub,
+    Arithmetic::SaturatingSub,
+    i8,
+    i16,
+    i32,
+    i64,
+    u8,
+    u16,
+    u32,
+    u64
 );
 impl_binary_func_fixed_output_vectorization!(
     Dot,
     dot,
-    __expand_dot,
-    __expand_dot_method,
     Arithmetic::Dot,
-    None,
+    0,
+    f16,
+    bf16,
+    flex32,
+    tf32,
+    f32,
+    f64,
+    i8,
+    i16,
+    i32,
+    i64,
+    u8,
+    u16,
+    u32,
+    u64
+);
+
+impl_binary_func_mixed_types!(
+    Powi,
+    powi,
+    i32,
+    Arithmetic::Powi,
     f16,
     bf16,
     flex32,

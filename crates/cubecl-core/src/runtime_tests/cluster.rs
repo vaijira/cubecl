@@ -1,5 +1,5 @@
+use crate::prelude::*;
 use crate::{self as cubecl};
-use crate::{Feature, prelude::*};
 
 #[cube(launch, cluster_dim = CubeDim::new_3d(1, 2, 3))]
 fn cluster_meta_kernel(out: &mut Array<u32>) {
@@ -21,7 +21,7 @@ fn cluster_meta_kernel(out: &mut Array<u32>) {
 }
 
 pub fn test_cluster_meta<R: Runtime>(client: ComputeClient<R::Server, R::Channel>) {
-    if !client.properties().feature_enabled(Feature::CubeCluster) {
+    if !client.properties().features.cube_cluster {
         return;
     }
 
@@ -43,7 +43,7 @@ pub fn test_cluster_meta<R: Runtime>(client: ComputeClient<R::Server, R::Channel
         ArrayArg::from_raw_parts::<f32>(&handle, num_cubes as usize * 8, vectorization)
     });
 
-    let actual = client.read_one(handle.binding());
+    let actual = client.read_one(handle);
     let actual = u32::from_bytes(&actual);
 
     let mut expected: Vec<u32> = vec![6, 1, 2, 3];

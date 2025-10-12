@@ -8,10 +8,10 @@ use crate::components::{
 
 #[derive(Default, Clone, Copy, Debug)]
 pub enum TileSizeSelection {
-    // Choses the smallest tile size possible.
+    // Chooses the smallest tile size possible.
     MinTileSize,
     #[default]
-    // Choses the biggest tile size possible.
+    // Chooses the biggest tile size possible.
     MaxTileSize,
 }
 
@@ -384,7 +384,7 @@ fn selection(
 pub fn closest_factor_pair(n: u32) -> (u32, u32) {
     let sqrt_n = (n as f64).sqrt() as u32;
     for a in (1..=sqrt_n).rev() {
-        if n % a == 0 {
+        if n.is_multiple_of(a) {
             return (n / a, a);
         }
     }

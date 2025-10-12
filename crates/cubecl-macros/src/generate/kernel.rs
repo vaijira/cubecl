@@ -26,15 +26,12 @@ impl KernelFn {
             let debug_source = frontend_type("debug_source_expand");
             let cube_debug = frontend_type("CubeDebug");
             let src_file = self.src_file.as_ref().map(|file| file.value());
-            #[cfg(nightly)]
-            let src_file = {
-                src_file.or_else(|| {
-                    let span: proc_macro::Span = self.span.unwrap();
-                    let source_path = span.source().local_file();
-                    let source_file = source_path.as_ref().and_then(|path| path.file_name());
-                    source_file.map(|file| file.to_string_lossy().into())
-                })
-            };
+            let src_file = src_file.or_else(|| {
+                let span: proc_macro::Span = self.span.unwrap();
+                let source_path = span.local_file();
+                let source_file = source_path.as_ref().and_then(|path| path.file_name());
+                source_file.map(|file| file.to_string_lossy().into())
+            });
             let source_text = match src_file {
                 Some(file) => quote![include_str!(#file)],
                 None => quote![""],
@@ -86,17 +83,12 @@ impl ToTokens for KernelSignature {
             }
             KernelReturns::Plain(ty) => quote![#ty],
         };
-        let out = if self
-            .parameters
-            .first()
-            .filter(|param| param.name == "self")
-            .is_some()
-        {
+        let out = if let Some(receiver) = &self.receiver_arg {
             let args = self.parameters.iter().skip(1);
 
             quote! {
                 fn #name #generics(
-                    self, // Always owned during expand.
+                    #receiver,
                     scope: &mut #scope,
                     #(#args),*
                 ) -> #return_type
@@ -147,14 +139,14 @@ impl Launch {
     pub fn compilation_args_def(&self) -> (Vec<TokenStream>, Vec<Ident>) {
         let mut tokens = Vec::new();
         let mut args = Vec::new();
-        let launch_arg_expand = prelude_type("LaunchArgExpand");
+        let launch_arg = prelude_type("LaunchArg");
 
         self.runtime_inputs().for_each(|input| {
             let ty = &input.ty_owned();
             let name = &input.name;
 
             tokens.push(quote! {
-                #name: <#ty as #launch_arg_expand>::CompilationArg
+                #name: <#ty as #launch_arg>::CompilationArg
             });
             args.push(name.clone());
         });
@@ -164,7 +156,7 @@ impl Launch {
             let name = &output.name;
 
             tokens.push(quote! {
-                #name: <#ty as #launch_arg_expand>::CompilationArg
+                #name: <#ty as #launch_arg>::CompilationArg
             });
             args.push(name.clone());
         });
@@ -207,14 +199,14 @@ impl Launch {
     }
 
     pub fn io_mappings(&self) -> TokenStream {
-        let launch_arg_expand = prelude_type("LaunchArgExpand");
+        let launch_arg = prelude_type("LaunchArg");
         let mut define = quote! {};
 
         let expand_fn = |ident, expand_name, ty| {
             let ty = self.analysis.process_ty(&ty);
 
             quote! {
-                let #ident =  <#ty as #launch_arg_expand>::#expand_name(&self.#ident.dynamic_cast(), &mut builder);
+                let #ident =  <#ty as #launch_arg>::#expand_name(&self.#ident.dynamic_cast(), &mut builder);
             }
         };
         for param in self.runtime_params() {
@@ -233,13 +225,14 @@ impl Launch {
     fn define_body(&self) -> TokenStream {
         let kernel_builder = prelude_type("KernelBuilder");
         let io_map = self.io_mappings();
-        let register_type = self.analysis.register_elems();
+        let register_type = self.analysis.register_types();
         let runtime_args = self.runtime_params().map(|it| &it.name);
         let comptime_args = self.comptime_params().map(|it| &it.name);
         let generics = self.analysis.process_generics(&self.func.sig.generics);
 
         quote! {
             let mut builder = #kernel_builder::default();
+            builder.runtime_properties(__R::target_properties());
             #register_type
             #io_map
             expand #generics(&mut builder.scope, #(#runtime_args.clone(),)* #(self.#comptime_args.clone()),*);
@@ -248,7 +241,8 @@ impl Launch {
     }
 
     /// Returns the kernel entrypoint name.
-    /// Appropriate for usage in source code such as naming the CUDA or WGSL entrypoint.
+    /// Appropriate for usage in source code such as naming the CUDA or WGSL
+    /// entrypoint.
     ///
     /// For example a kernel:
     /// ```text
@@ -257,15 +251,16 @@ impl Launch {
     /// ```
     /// would produce the name `my_kernel`.
     ///
-    /// If a generic has the `Float` or `Numeric` bound the kernel also has a suffix
-    /// with the name of that type in use:
+    /// If a generic has the `Float` or `Numeric` bound the kernel also has a
+    /// suffix with the name of that type in use:
     /// ```text
     /// fn my_kernel<F: Float>(input: &Array<F>, output: &mut Array<F>) {}
     /// ```
     /// now produces the name `my_kernel_f16` or `my_kernel_f32` etc. depending
     /// on which variant of the kernel is launched by the user.
     ///
-    /// If a kernel has several matching bounds they are appended as suffixes in order.
+    /// If a kernel has several matching bounds they are appended as suffixes in
+    /// order.
     fn kernel_entrypoint_name(&self) -> TokenStream {
         // This base name is always used; a suffix might be added
         // based on generics.
@@ -284,7 +279,8 @@ impl Launch {
                     continue;
                 };
 
-                // Using last should account for the bounds such as `Float` but also `some::prefix::Float`
+                // Using last should account for the bounds such as `Float` but also
+                // `some::prefix::Float`
                 let Some(generic_trailing) = t.path.segments.last() else {
                     continue;
                 };
@@ -360,7 +356,7 @@ impl Launch {
                 settings.extend(quote![.debug_symbols()]);
             }
             if let Some(mode) = &self.args.fast_math {
-                settings.extend(quote![.fp_math_mode(#mode)]);
+                settings.extend(quote![.fp_math_mode((#mode).into())]);
             }
             if let Some(cluster_dim) = &self.args.cluster_dim {
                 settings.extend(quote![.cluster_dim(#cluster_dim)]);

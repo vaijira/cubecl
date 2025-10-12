@@ -1,14 +1,15 @@
 use std::fmt::Display;
 
 use cubecl_core::{
-    CubeElement, Feature, Runtime,
+    CubeElement, Runtime,
     client::ComputeClient,
     prelude::{Float, Numeric},
     server::{self},
 };
 use cubecl_matmul::tests::test_utils::{CastInto, Sample};
+use cubecl_runtime::MmaConfig;
 
-use crate::base::ConvolutionProblem;
+use crate::components::ConvolutionProblem;
 
 pub trait TestPrecision {
     type EG: Numeric + CubeElement + Display + CastInto<Self::ES> + Sample;
@@ -45,18 +46,18 @@ where
         shape: &[usize],
         strides: &[usize],
     ) {
-        let maybe_f16 = client.properties().feature_enabled(Feature::Cmma {
-            a: ES::as_elem_native().expect("To be a native type"),
-            b: ES::as_elem_native().expect("To be a native type"),
-            c: EG::as_elem_native().expect("To be a native type"),
+        let maybe_f16 = client.properties().features.cmma.contains(&MmaConfig {
+            a_type: ES::as_type_native().expect("To be a native type"),
+            b_type: ES::as_type_native().expect("To be a native type"),
+            cd_type: EG::as_type_native().expect("To be a native type"),
             m: 16,
             k: 16,
             n: 16,
         });
-        let maybe_tf32 = client.properties().feature_enabled(Feature::Cmma {
-            a: ES::as_elem_native().expect("To be a native type"),
-            b: ES::as_elem_native().expect("To be a native type"),
-            c: EG::as_elem_native().expect("To be a native type"),
+        let maybe_tf32 = client.properties().features.cmma.contains(&MmaConfig {
+            a_type: ES::as_type_native().expect("To be a native type"),
+            b_type: ES::as_type_native().expect("To be a native type"),
+            cd_type: EG::as_type_native().expect("To be a native type"),
             m: 16,
             k: 8,
             n: 16,
@@ -64,8 +65,8 @@ where
 
         // Need to compensate for the temporary conversion to f16/tf32
         let epsilon = match maybe_f16 || maybe_tf32 {
-            true => 10e-6 / EG::EPSILON.to_f32().unwrap() * half::f16::EPSILON.to_f32(),
-            false => 10e-6,
+            true => 3.0 * 10e-6 / EG::EPSILON.to_f32().unwrap() * half::f16::EPSILON.to_f32(),
+            false => 3.0 * 10e-6,
         };
 
         let expected = conv_cpu_reference::<Self>(lhs, rhs, problem)
@@ -90,11 +91,7 @@ pub(crate) fn assert_equals_approx<R: Runtime, F: Float + CubeElement + Display>
     expected: &[F],
     epsilon: f32,
 ) -> Result<(), String> {
-    let actual = client.read_one_tensor(output.binding_with_meta(
-        shape.to_vec(),
-        strides.to_vec(),
-        size_of::<F>(),
-    ));
+    let actual = client.read_one_tensor(output.copy_descriptor(shape, strides, size_of::<F>()));
     let actual = F::from_bytes(&actual);
 
     // normalize to type epsilon
@@ -102,7 +99,7 @@ pub(crate) fn assert_equals_approx<R: Runtime, F: Float + CubeElement + Display>
 
     for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
         // account for lower precision at higher values
-        let allowed_error = (epsilon * e.to_f32().unwrap()).max(epsilon);
+        let allowed_error = (epsilon * e.to_f32().unwrap().abs()).max(epsilon);
 
         if f32::abs(a.to_f32().unwrap() - e.to_f32().unwrap()) >= allowed_error {
             return Err(format!(

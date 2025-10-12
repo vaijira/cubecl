@@ -1,3 +1,4 @@
+use cubecl_core::server::IoError;
 use cubecl_runtime::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
 use hashbrown::HashMap;
 use std::num::NonZeroU64;
@@ -21,14 +22,20 @@ impl core::fmt::Debug for WgpuStorage {
 #[derive(new, Debug)]
 pub struct WgpuResource {
     /// The wgpu buffer.
-    buffer: wgpu::Buffer,
-    offset: u64,
-    size: u64,
+    pub buffer: wgpu::Buffer,
+    /// The buffer offset.
+    pub offset: u64,
+    /// The size of the resource.
+    ///
+    /// # Notes
+    ///
+    /// The result considers the offset.
+    pub size: u64,
 }
 
 impl WgpuResource {
     /// Return the binding view of the buffer.
-    pub fn as_wgpu_bind_resource(&self) -> wgpu::BindingResource {
+    pub fn as_wgpu_bind_resource(&self) -> wgpu::BindingResource<'_> {
         let binding = wgpu::BufferBinding {
             buffer: &self.buffer,
             offset: self.offset,
@@ -37,20 +44,6 @@ impl WgpuResource {
             ),
         };
         wgpu::BindingResource::Buffer(binding)
-    }
-
-    pub fn buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
-    }
-
-    /// Return the buffer size.
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-
-    /// Return the buffer offset.
-    pub fn offset(&self) -> u64 {
-        self.offset
     }
 }
 
@@ -79,7 +72,7 @@ impl ComputeStorage for WgpuStorage {
         WgpuResource::new(buffer.clone(), handle.offset(), handle.size())
     }
 
-    fn alloc(&mut self, size: u64) -> StorageHandle {
+    fn alloc(&mut self, size: u64) -> Result<StorageHandle, IoError> {
         let id = StorageId::new();
 
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -90,7 +83,10 @@ impl ComputeStorage for WgpuStorage {
         });
 
         self.memory.insert(id, buffer);
-        StorageHandle::new(id, StorageUtilization { offset: 0, size })
+        Ok(StorageHandle::new(
+            id,
+            StorageUtilization { offset: 0, size },
+        ))
     }
 
     fn dealloc(&mut self, id: StorageId) {

@@ -21,6 +21,7 @@ impl<R: Runtime, MP: MatmulPrecision> Benchmark for Conv2dBench<R, MP> {
         TensorHandle<R, MP::EI>,
         TensorHandle<R, MP::EI>,
     );
+    type Output = ();
 
     fn prepare(&self) -> Self::Input {
         let client = R::client(&self.device);
@@ -61,7 +62,7 @@ impl<R: Runtime, MP: MatmulPrecision> Benchmark for Conv2dBench<R, MP> {
         let h_out = (h_in + 2 * p_h - d_h * (k_h - 1) - 1) / s_h + 1;
         let w_out = (w_in + 2 * p_w - d_w * (k_w - 1) - 1) / s_w + 1;
 
-        let out: TensorHandle<R, MP::EO> =
+        let out: TensorHandle<R, AccG<MP>> =
             TensorHandle::empty(&client, vec![n, c_out, h_out, w_out]);
 
         convolution::launch_conv::<R, MP, SimpleConvAlgorithm<AcceleratedMatmul>, 2>(
@@ -82,8 +83,8 @@ impl<R: Runtime, MP: MatmulPrecision> Benchmark for Conv2dBench<R, MP> {
             R::name(&client),
             MP::EI::as_elem_native_unchecked(),
             MP::ES::as_elem_native_unchecked(),
-            MP::EA::as_elem_native_unchecked(),
-            MP::EO::as_elem_native_unchecked(),
+            MP::EA::as_type_native_unchecked(),
+            AccG<MP>::as_type_native_unchecked(),
         )
         .to_lowercase()
     }
@@ -93,7 +94,7 @@ impl<R: Runtime, MP: MatmulPrecision> Benchmark for Conv2dBench<R, MP> {
     }
 
     fn profile(&self, args: Self::Input) -> cubecl::benchmark::ProfileDuration {
-        self.client.profile(|| self.execute(args))
+        self.client.profile(|| self.execute(args), "conv-bench")
     }
 }
 

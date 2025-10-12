@@ -1,22 +1,28 @@
-use cubecl_core::CubeElement;
 use cubecl_core::prelude::*;
-use cubecl_matmul::components::AvailableLineSizes;
+use cubecl_core::{CubeElement, server::Allocation};
+use cubecl_matmul::components::MatmulIdent;
 use cubecl_matmul::components::MatmulSelection;
 use cubecl_matmul::components::global::GlobalConfig;
+use cubecl_matmul::{MatmulInputHandleRef, components::AvailableLineSizes};
 
-use crate::ConvGemmConfig;
-use crate::algorithm::Algorithm;
-use crate::args::ConvInputsLaunch;
-use crate::base::ConvolutionLaunch;
-use crate::base::ConvolutionProblem;
-use cubecl_matmul::components::InputIdent;
-use cubecl_matmul::components::global::args::{ConcreteOutputFactory, MatmulArgs};
+use cubecl_matmul::components::global::args::MatmulArgs;
+use cubecl_matmul::tests::layered::matmul_test_launcher::TensorRawParts;
 use cubecl_matmul::tests::test_utils::Sample;
-use cubecl_matmul::{components::Ident, tests::layered::matmul_test_launcher::TensorRawParts};
+
+use crate::{
+    components::{
+        ConvGemmConfig as _, ConvolutionProblem,
+        global::{
+            args::{ConcreteInputsFactory, ConcreteOutputFactory},
+            entry_point::ConvolutionLaunch,
+        },
+    },
+    kernels::layered::algorithm::Algorithm,
+};
 
 use super::test_utils::TestPrecision;
 
-type Input<Args, EI> = <Args as MatmulArgs>::Input<EI>;
+type Input<Args, Lhs, Rhs, EO> = <Args as MatmulArgs>::Input<Lhs, Rhs, EO>;
 type Output<Args, EO> = <Args as MatmulArgs>::Output<EO>;
 
 /// Test the correctness of the specified Matmul on the given device,
@@ -30,7 +36,7 @@ pub fn test_convolution_algorithm<A, Args, P, R>(
     Args: MatmulArgs,
     P: TestPrecision,
     R: Runtime,
-    Args::Input<P::EG>: ConvInputsLaunch,
+    Args::Input<P::EG, P::EG, P::EG>: ConcreteInputsFactory,
     Args::Output<P::EG>: ConcreteOutputFactory,
 {
     let env = std::env::var("MATMUL_TEST_MODE");
@@ -43,14 +49,14 @@ pub fn test_convolution_algorithm<A, Args, P, R>(
         },
         Err(_) => false,
     };
-    let lhs = tensor_raw_parts::<P, R>(&client, &problem, Ident::Lhs);
-    let rhs = tensor_raw_parts::<P, R>(&client, &problem, Ident::Rhs);
-    let out = tensor_raw_parts::<P, R>(&client, &problem, Ident::Out);
+    let lhs = tensor_raw_parts::<P, R>(&client, &problem, MatmulIdent::Lhs);
+    let rhs = tensor_raw_parts::<P, R>(&client, &problem, MatmulIdent::Rhs);
+    let out = tensor_raw_parts::<P, R>(&client, &problem, MatmulIdent::Out);
 
     let line_sizes = AvailableLineSizes {
         lhs: vec![1],
         rhs: vec![1],
-        out: R::line_size_elem(&P::EG::as_elem_native_unchecked()).collect(),
+        out: R::io_optimized_line_sizes_unchecked(&P::EG::as_type_native_unchecked()).collect(),
     }
     .filter_lhs_with_tensor(&lhs.strides, &lhs.shape, problem.lhs_layout)
     .filter_rhs_with_tensor(&rhs.strides, &rhs.shape, problem.rhs_layout)
@@ -58,20 +64,31 @@ pub fn test_convolution_algorithm<A, Args, P, R>(
     .pick_max()
     .unwrap();
 
-    let config =
-        match A::setup::<R, (P::EG, P::ES, f32, P::EG)>(&client, &problem, &selection, &line_sizes)
-        {
-            Ok(config) => config,
-            Err(err) => {
-                let msg = format!("Can't launch the test: {err}");
-                if panic_on_launch_err {
-                    panic!("{msg}");
-                } else {
-                    println!("{msg}");
-                    return;
-                }
+    let config = match A::setup::<R, (P::EG, P::EG, P::EG, P::ES, P::ES, f32)>(
+        &client,
+        &problem,
+        &selection,
+        &line_sizes,
+    ) {
+        Ok(config) => config,
+        Err(err) => {
+            let msg = format!("Can't launch the test: {err}");
+            if panic_on_launch_err {
+                panic!("{msg}");
+            } else {
+                println!("{msg}");
+                return;
             }
-        };
+        }
+    };
+
+    let props = &client.properties().hardware;
+    if !props.max_cube_dim.can_contain(config.cube_dim())
+        || config.cube_dim().num_elems() > props.max_units_per_cube
+    {
+        println!("Skipping test, too many resources requested");
+        return;
+    }
 
     let elem_size = size_of::<P::EG>();
     let lhs_handle = unsafe {
@@ -84,33 +101,40 @@ pub fn test_convolution_algorithm<A, Args, P, R>(
         TensorHandleRef::from_raw_parts(&out.handle, &out.strides, &out.shape, elem_size)
     };
 
-    let lhs_handle = A::into_tensor_handle::<R, P::EG>(&client, &lhs_handle, InputIdent::Lhs);
-    let rhs_handle = A::into_tensor_handle::<R, P::EG>(&client, &rhs_handle, InputIdent::Rhs);
+    let lhs_handle = A::into_tensor_handle::<R, P::EG>(&client, &lhs_handle, MatmulIdent::Lhs);
+    let rhs_handle = A::into_tensor_handle::<R, P::EG>(&client, &rhs_handle, MatmulIdent::Rhs);
 
-    let lhs_handle = lhs_handle.as_ref();
-    let rhs_handle = rhs_handle.as_ref();
+    let lhs_handle = MatmulInputHandleRef::new(lhs_handle.as_ref());
+    let rhs_handle = MatmulInputHandleRef::new(rhs_handle.as_ref());
 
-    let inputs = <Input<Args, P::EG> as ConvInputsLaunch>::create(
+    let inputs = <Input<Args, P::EG, P::EG, P::EG> as ConcreteInputsFactory>::create(
+        &client,
         &lhs_handle,
         &rhs_handle,
+        None,
         &selection,
         &problem,
         &config.line_sizes(),
+        config,
     );
     let output = <Output<Args, P::EG> as ConcreteOutputFactory>::create(
+        &client,
         &out_handle,
         &selection,
-        &problem.as_matmul_problem(),
+        &problem,
         &config.line_sizes(),
+        config,
     );
 
     unsafe {
-        A::GlobalConvolution::launch_unchecked::<((P::EG, P::ES, P::EA, P::EG), Args), R>(
+        A::GlobalConvolution::launch_unchecked::<
+            ((P::EG, P::EG, P::EG, P::ES, P::ES, P::EA), Args),
+            R,
+        >(
             &client,
             config.cube_dim(),
             A::cube_count(&selection, &problem),
             inputs,
-            None,
             output,
             &problem,
             config,
@@ -131,15 +155,15 @@ pub fn test_convolution_algorithm<A, Args, P, R>(
 fn tensor_raw_parts<P: TestPrecision, R: Runtime>(
     client: &ComputeClient<R::Server, R::Channel>,
     problem: &ConvolutionProblem,
-    ident: Ident,
+    ident: MatmulIdent,
 ) -> TensorRawParts<P::EG> {
     match ident {
-        Ident::Lhs => {
+        MatmulIdent::Lhs => {
             let shape = shape(problem, ident);
 
             let handle = P::EG::sample::<R>(client, &shape, 1234);
 
-            let data = client.read_one(handle.handle.clone().binding());
+            let data = client.read_one_tensor(handle.as_copy_descriptor());
             let data = P::EG::from_bytes(&data);
             let original_data = data.to_owned();
 
@@ -149,15 +173,14 @@ fn tensor_raw_parts<P: TestPrecision, R: Runtime>(
                 shape,
                 strides: handle.strides,
                 original_data: Some(original_data),
-                quant_params: None,
             }
         }
-        Ident::Rhs => {
+        MatmulIdent::Rhs => {
             let shape = shape(problem, ident);
 
             let handle = P::EG::sample::<R>(client, &shape, 1234);
 
-            let data = client.read_one(handle.handle.clone().binding());
+            let data = client.read_one_tensor(handle.as_copy_descriptor());
             let data = P::EG::from_bytes(&data);
             let original_data = data.to_owned();
 
@@ -167,16 +190,15 @@ fn tensor_raw_parts<P: TestPrecision, R: Runtime>(
                 shape,
                 strides: handle.strides,
                 original_data: Some(original_data),
-                quant_params: None,
             }
         }
-        Ident::Out => {
+        MatmulIdent::Out => {
             let zero = P::EG::from_int(0);
 
-            let data = vec![zero; tensor_size(problem, Ident::Out)];
+            let data = vec![zero; tensor_size(problem, MatmulIdent::Out)];
 
-            let shape = shape(problem, Ident::Out);
-            let (handle, strides) =
+            let shape = shape(problem, MatmulIdent::Out);
+            let Allocation { handle, strides } =
                 client.create_tensor(P::EG::as_bytes(&data), &shape, size_of::<P::EG>());
 
             TensorRawParts {
@@ -185,38 +207,39 @@ fn tensor_raw_parts<P: TestPrecision, R: Runtime>(
                 shape,
                 strides,
                 original_data: None,
-                quant_params: None,
             }
         }
     }
 }
 
 /// Returns the total number of elements for the identified tensor, inferred by the problem definition
-pub(crate) fn tensor_size(problem: &ConvolutionProblem, ident: Ident) -> usize {
+pub(crate) fn tensor_size(problem: &ConvolutionProblem, ident: MatmulIdent) -> usize {
     match ident {
-        Ident::Lhs => problem.m * problem.k,
-        Ident::Rhs => problem.k * problem.n,
-        Ident::Out => problem.m * problem.n,
+        MatmulIdent::Lhs => problem.m * problem.k,
+        MatmulIdent::Rhs => problem.k * problem.n,
+        MatmulIdent::Out => problem.m * problem.n,
     }
 }
 
 /// Returns the shape of the identified tensor, inferred by the problem definition
-pub(crate) fn shape(problem: &ConvolutionProblem, ident: Ident) -> Vec<usize> {
+pub(crate) fn shape(problem: &ConvolutionProblem, ident: MatmulIdent) -> Vec<usize> {
     match ident {
-        Ident::Lhs => vec![
+        MatmulIdent::Lhs => vec![
             problem.batches,
             problem.shape[0],
             problem.shape[1],
             problem.channels,
         ],
-        Ident::Rhs => vec![
+        MatmulIdent::Rhs => vec![
             problem.n,
             problem.kernel_size[0] as usize,
             problem.kernel_size[1] as usize,
             problem.channels,
         ],
-        Ident::Out => vec![
-            problem.batches * problem.out_shape.iter().product::<usize>(),
+        MatmulIdent::Out => vec![
+            problem.batches,
+            problem.out_shape[0],
+            problem.out_shape[1],
             problem.n,
         ],
     }

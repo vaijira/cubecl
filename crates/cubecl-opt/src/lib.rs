@@ -33,10 +33,9 @@ use std::{
 };
 
 use analyses::{AnalysisCache, dominance::DomFrontiers, liveness::Liveness, writes::Writes};
-use cubecl_common::{CubeDim, ExecutionMode};
-use cubecl_core::post_processing::checked_io::CheckedIoProcessor;
+use cubecl_common::CubeDim;
 use cubecl_ir::{
-    self as core, Allocator, Branch, Id, Item, Operation, Operator, Processor, Scope, Variable,
+    self as core, Allocator, Branch, Id, Operation, Operator, Processor, Scope, Type, Variable,
     VariableKind,
 };
 use gvn::GvnPass;
@@ -71,6 +70,8 @@ pub use petgraph::graph::{EdgeIndex, NodeIndex};
 pub use transformers::*;
 pub use version::PhiInstruction;
 
+pub use crate::analyses::liveness::shared::SharedLiveness;
+
 /// An atomic counter with a simplified interface.
 #[derive(Clone, Debug, Default)]
 pub struct AtomicCounter {
@@ -100,14 +101,14 @@ impl AtomicCounter {
 pub struct ConstArray {
     pub id: Id,
     pub length: u32,
-    pub item: Item,
+    pub item: Type,
     pub values: Vec<core::Variable>,
 }
 
 #[derive(Default, Debug, Clone)]
-struct Program {
+pub struct Program {
     pub const_arrays: Vec<ConstArray>,
-    pub variables: HashMap<Id, Item>,
+    pub variables: HashMap<Id, Type>,
     pub graph: StableDiGraph<BasicBlock, u32>,
     root: NodeIndex,
 }
@@ -132,7 +133,7 @@ type VarId = (Id, u16);
 #[derive(Debug, Clone)]
 pub struct Optimizer {
     /// The overall program state
-    program: Program,
+    pub program: Program,
     /// Allocator for kernel
     pub allocator: Allocator,
     /// Analyses with persistent state
@@ -147,9 +148,8 @@ pub struct Optimizer {
     pub root_scope: Scope,
     /// The `CubeDim` used for range analysis
     pub(crate) cube_dim: CubeDim,
-    /// The execution mode, `Unchecked` skips bounds check optimizations.
-    pub(crate) mode: ExecutionMode,
     pub(crate) transformers: Vec<Rc<dyn IrTransformer>>,
+    pub(crate) processors: Rc<Vec<Box<dyn Processor>>>,
 }
 
 impl Default for Optimizer {
@@ -162,9 +162,9 @@ impl Default for Optimizer {
             ret: Default::default(),
             root_scope: Scope::root(false),
             cube_dim: Default::default(),
-            mode: Default::default(),
             analysis_cache: Default::default(),
             transformers: Default::default(),
+            processors: Default::default(),
         }
     }
 }
@@ -175,18 +175,34 @@ impl Optimizer {
     pub fn new(
         expand: Scope,
         cube_dim: CubeDim,
-        mode: ExecutionMode,
         transformers: Vec<Rc<dyn IrTransformer>>,
+        processors: Vec<Box<dyn Processor>>,
     ) -> Self {
         let mut opt = Self {
             root_scope: expand.clone(),
             cube_dim,
-            mode,
             allocator: expand.allocator.clone(),
             transformers,
+            processors: Rc::new(processors),
             ..Default::default()
         };
         opt.run_opt();
+
+        opt
+    }
+
+    /// Create a new optimizer with the scope, `CubeDim` and execution mode passed into the compiler.
+    /// Parses the scope and runs several optimization and analysis loops.
+    pub fn shared_only(expand: Scope, cube_dim: CubeDim) -> Self {
+        let mut opt = Self {
+            root_scope: expand.clone(),
+            cube_dim,
+            allocator: expand.allocator.clone(),
+            transformers: Vec::new(),
+            processors: Rc::new(Vec::new()),
+            ..Default::default()
+        };
+        opt.run_shared_only();
 
         opt
     }
@@ -220,7 +236,20 @@ impl Optimizer {
             self.apply_post_ssa_passes();
         }
 
+        self.split_free();
+        self.analysis::<SharedLiveness>();
+
         MergeBlocks.apply_post_ssa(self, AtomicCounter::new(0));
+    }
+
+    /// Run only the shared memory analysis
+    fn run_shared_only(&mut self) {
+        self.parse_graph(self.root_scope.clone());
+        self.split_critical_edges();
+        self.exempt_index_assign_locals();
+        self.ssa_transform();
+        self.split_free();
+        self.analysis::<SharedLiveness>();
     }
 
     /// The entry block of the program
@@ -292,10 +321,10 @@ impl Optimizer {
         for node in self.node_ids() {
             let ops = self.program[node].ops.clone();
             for op in ops.borrow().values() {
-                if let Operation::Operator(Operator::IndexAssign(_)) = &op.operation {
-                    if let VariableKind::LocalMut { id } = &op.out().kind {
-                        self.program.variables.remove(id);
-                    }
+                if let Operation::Operator(Operator::IndexAssign(_)) = &op.operation
+                    && let VariableKind::LocalMut { id } = &op.out().kind
+                {
+                    self.program.variables.remove(id);
                 }
             }
         }
@@ -349,23 +378,27 @@ impl Optimizer {
 
     /// Recursively parse a scope into the graph
     pub fn parse_scope(&mut self, mut scope: Scope) -> bool {
-        let checked_io: Box<dyn Processor> = Box::new(CheckedIoProcessor::new(self.mode));
-        let processed = scope.process([checked_io]);
+        let processed = scope.process(self.processors.iter().map(|it| &**it));
 
         for var in processed.variables {
             if let VariableKind::LocalMut { id } = var.kind {
-                self.program.variables.insert(id, var.item);
+                self.program.variables.insert(id, var.ty);
             }
         }
 
         for (var, values) in scope.const_arrays.clone() {
-            let VariableKind::ConstantArray { id, length } = var.kind else {
+            let VariableKind::ConstantArray {
+                id,
+                length,
+                unroll_factor,
+            } = var.kind
+            else {
                 unreachable!()
             };
             self.program.const_arrays.push(ConstArray {
                 id,
-                length,
-                item: var.item,
+                length: length * unroll_factor,
+                item: var.ty,
                 values,
             });
         }
@@ -408,7 +441,7 @@ impl Optimizer {
     /// Gets the `id` and `depth` of the variable if it's a `Local` and not atomic, `None` otherwise.
     pub fn local_variable_id(&mut self, variable: &core::Variable) -> Option<Id> {
         match variable.kind {
-            core::VariableKind::LocalMut { id } if !variable.item.elem.is_atomic() => Some(id),
+            core::VariableKind::LocalMut { id } if !variable.ty.is_atomic() => Some(id),
             _ => None,
         }
     }
@@ -442,7 +475,7 @@ mod test {
     use cubecl_core as cubecl;
     use cubecl_core::cube;
     use cubecl_core::prelude::*;
-    use cubecl_ir::{Elem, ExpandElement, Item, UIntKind, Variable, VariableKind};
+    use cubecl_ir::{ElemType, ExpandElement, Type, UIntKind, Variable, VariableKind};
 
     use crate::Optimizer;
 
@@ -465,19 +498,19 @@ mod test {
         let mut ctx = Scope::root(false);
         let x = ExpandElement::Plain(Variable::new(
             VariableKind::GlobalScalar(0),
-            Item::new(Elem::UInt(UIntKind::U32)),
+            Type::scalar(ElemType::UInt(UIntKind::U32)),
         ));
         let cond = ExpandElement::Plain(Variable::new(
             VariableKind::GlobalScalar(1),
-            Item::new(Elem::UInt(UIntKind::U32)),
+            Type::scalar(ElemType::UInt(UIntKind::U32)),
         ));
         let arr = ExpandElement::Plain(Variable::new(
             VariableKind::GlobalOutputArray(0),
-            Item::new(Elem::UInt(UIntKind::U32)),
+            Type::scalar(ElemType::UInt(UIntKind::U32)),
         ));
 
         pre_kernel::expand(&mut ctx, x.into(), cond.into(), arr.into());
-        let opt = Optimizer::new(ctx, CubeDim::default(), ExecutionMode::Checked, vec![]);
+        let opt = Optimizer::new(ctx, CubeDim::default(), vec![], vec![]);
         println!("{opt}")
     }
 }

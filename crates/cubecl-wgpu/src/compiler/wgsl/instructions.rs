@@ -359,6 +359,14 @@ pub enum Instruction {
         rhs: Variable,
         out: Variable,
     },
+    IsNan {
+        input: Variable,
+        out: Variable,
+    },
+    IsInf {
+        input: Variable,
+        out: Variable,
+    },
     VecInit {
         inputs: Vec<Variable>,
         out: Variable,
@@ -393,6 +401,8 @@ impl Display for Instruction {
                     assert_eq!(lhs, out, "Can't use regular addition on atomic");
                     writeln!(f, "atomicAdd({out}, {rhs});")
                 } else {
+                    let lhs = lhs.fmt_cast_to(out.item());
+                    let rhs = rhs.fmt_cast_to(out.item());
                     let out = out.fmt_left();
                     writeln!(f, "{out} = {lhs} + {rhs};")
                 }
@@ -419,6 +429,9 @@ impl Display for Instruction {
                 writeln!(f, "let {out}_ptr = &{input};")
             }
             Instruction::Fma { a, b, c, out } => {
+                let a = a.fmt_cast_to(out.item());
+                let b = b.fmt_cast_to(out.item());
+                let c = c.fmt_cast_to(out.item());
                 let out = out.fmt_left();
                 writeln!(f, "{out} = fma({a}, {b}, {c});")
             }
@@ -427,6 +440,8 @@ impl Display for Instruction {
                     assert_eq!(lhs, out, "Can't use regular min on atomic");
                     writeln!(f, "atomicMin({out}, {rhs});")
                 } else {
+                    let lhs = lhs.fmt_cast_to(out.item());
+                    let rhs = rhs.fmt_cast_to(out.item());
                     let out = out.fmt_left();
                     writeln!(f, "{out} = min({lhs}, {rhs});")
                 }
@@ -436,23 +451,47 @@ impl Display for Instruction {
                     assert_eq!(lhs, out, "Can't use regular max on atomic");
                     writeln!(f, "atomicMax({out}, {rhs});")
                 } else {
+                    let lhs = lhs.fmt_cast_to(out.item());
+                    let rhs = rhs.fmt_cast_to(out.item());
                     let out = out.fmt_left();
                     writeln!(f, "{out} = max({lhs}, {rhs});")
                 }
             }
             Instruction::And { lhs, rhs, out } => {
+                let line_size = out.item().vectorization_factor();
                 if out.is_atomic() {
                     assert_eq!(lhs, out, "Can't use regular and on atomic");
                     writeln!(f, "atomicAnd({out}, {rhs});")
+                } else if line_size > 1 {
+                    let item = out.item();
+                    let out = out.fmt_left();
+                    writeln!(f, "{out} = {item}(")?;
+                    for i in 0..line_size {
+                        let lhs_i = lhs.index(i);
+                        let rhs_i = rhs.index(i);
+                        writeln!(f, "{lhs_i} && {rhs_i},")?;
+                    }
+                    writeln!(f, ");")
                 } else {
                     let out = out.fmt_left();
                     writeln!(f, "{out} = {lhs} && {rhs};")
                 }
             }
             Instruction::Or { lhs, rhs, out } => {
+                let line_size = out.item().vectorization_factor();
                 if out.is_atomic() {
                     assert_eq!(lhs, out, "Can't use regular or on atomic");
                     writeln!(f, "atomicOr({out}, {rhs});")
+                } else if line_size > 1 {
+                    let item = out.item();
+                    let out = out.fmt_left();
+                    writeln!(f, "{out} = {item}(")?;
+                    for i in 0..line_size {
+                        let lhs_i = lhs.index(i);
+                        let rhs_i = rhs.index(i);
+                        writeln!(f, "{lhs_i} || {rhs_i},")?;
+                    }
+                    writeln!(f, ");")
                 } else {
                     let out = out.fmt_left();
                     writeln!(f, "{out} = {lhs} || {rhs};")
@@ -493,17 +532,14 @@ impl Display for Instruction {
                 Ok(())
             }
             Instruction::Modulo { lhs, rhs, out } => {
+                let lhs = lhs.fmt_cast_to(out.item());
+                let rhs = rhs.fmt_cast_to(out.item());
                 let out = out.fmt_left();
                 writeln!(f, "{out} = {lhs} % {rhs};")
             }
             Instruction::Remainder { lhs, rhs, out } => {
-                let f_type = match lhs.item() {
-                    Item::Vec4(_) => Item::Vec4(Elem::F32),
-                    Item::Vec3(_) => Item::Vec3(Elem::F32),
-                    Item::Vec2(_) => Item::Vec2(Elem::F32),
-                    Item::Scalar(_) => Item::Scalar(Elem::F32),
-                };
-                let ty = lhs.item();
+                let f_type = out.item().with_elem(Elem::F32);
+                let ty = out.item();
                 let lhs = lhs.fmt_cast_to(f_type);
                 let rhs = rhs.fmt_cast_to(f_type);
                 let out = out.fmt_left();
@@ -515,15 +551,21 @@ impl Display for Instruction {
                     assert_eq!(lhs, out, "Can't use regular sub on atomic");
                     writeln!(f, "atomicSub({out}, {rhs});")
                 } else {
+                    let lhs = lhs.fmt_cast_to(out.item());
+                    let rhs = rhs.fmt_cast_to(out.item());
                     let out = out.fmt_left();
                     writeln!(f, "{out} = {lhs} - {rhs};")
                 }
             }
             Instruction::Mul { lhs, rhs, out } => {
+                let lhs = lhs.fmt_cast_to(out.item());
+                let rhs = rhs.fmt_cast_to(out.item());
                 let out = out.fmt_left();
                 writeln!(f, "{out} = {lhs} * {rhs};")
             }
             Instruction::Div { lhs, rhs, out } => {
+                let lhs = lhs.fmt_cast_to(out.item());
+                let rhs = rhs.fmt_cast_to(out.item());
                 let out = out.fmt_left();
                 writeln!(f, "{out} = {lhs} / {rhs};")
             }
@@ -550,15 +592,9 @@ impl Display for Instruction {
                 let out = out.fmt_left();
                 writeln!(f, "{out} = clamp({input}, {min}, {max});")
             }
-            Instruction::Powf { lhs, rhs, out } => {
-                if rhs.is_always_scalar() || rhs.item().vectorization_factor() == 1 {
-                    let out = out.fmt_left();
-                    writeln!(f, "{out} = powf_scalar({lhs}, {rhs});")
-                } else {
-                    let out = out.fmt_left();
-                    writeln!(f, "{out} = powf({lhs}, {rhs});")
-                }
-            }
+            Instruction::Powf { lhs, rhs, out } => super::call_powf(f, lhs, rhs, out),
+            Instruction::IsNan { input, out } => super::call_is_nan(f, input, out),
+            Instruction::IsInf { input, out } => super::call_is_inf(f, input, out),
             Instruction::Sqrt { input, out } => {
                 let out = out.fmt_left();
                 writeln!(f, "{out} = sqrt({input});")
@@ -576,17 +612,20 @@ impl Display for Instruction {
                 writeln!(f, "{out} = sin({input});")
             }
             Instruction::Tanh { input, out } => {
-                let out = out.fmt_left();
                 #[cfg(target_os = "macos")]
-                let result = writeln!(f, "{out} = safe_tanh({input});");
+                let result = super::call_safe_tanh(f, input, out);
                 #[cfg(not(target_os = "macos"))]
-                let result = writeln!(f, "{out} = tanh({input});");
+                let result = {
+                    let out = out.fmt_left();
+                    writeln!(f, "{out} = tanh({input});")
+                };
 
                 result
             }
             Instruction::Recip { input, out } => {
+                let item = input.item();
                 let out = out.fmt_left();
-                write!(f, "{out} = 1.0 / {input};")
+                write!(f, "{out} = {item}(1.0) / {input};")
             }
             Instruction::Equal { lhs, rhs, out } => comparison(lhs, rhs, out, "==", f),
             Instruction::Lower { lhs, rhs, out } => comparison(lhs, rhs, out, "<", f),
@@ -690,28 +729,14 @@ for (var {i}: {i_ty} = {start}; {i} {cmp} {end}; {increment}) {{
                 or_else,
                 out,
             } => {
-                let vf_then = then.item().vectorization_factor();
-                let vf_or_else = or_else.item().vectorization_factor();
-                let vf_out = out.item().vectorization_factor();
-                let vf_cond = cond.item().vectorization_factor();
-                let vf = usize::max(vf_cond, vf_out);
-                let vf = usize::max(vf, vf_then);
-                let vf = usize::max(vf, vf_or_else);
+                let bool_ty = out.item().with_elem(Elem::Bool);
 
+                let cond = cond.fmt_cast_to(bool_ty);
+                let then = then.fmt_cast_to(out.item());
+                let or_else = or_else.fmt_cast_to(out.item());
                 let out = out.fmt_left();
-                if vf != vf_then || vf != vf_or_else || vf != vf_cond || vf != vf_out {
-                    writeln!(f, "{out} = vec{vf}(")?;
-                    for i in 0..vf {
-                        let theni = then.index(i);
-                        let or_elsei = or_else.index(i);
-                        let condi = cond.index(i);
 
-                        writeln!(f, "select({or_elsei}, {theni}, {condi}),")?;
-                    }
-                    writeln!(f, ");")
-                } else {
-                    writeln!(f, "{out} = select({or_else}, {then}, {cond});")
-                }
+                writeln!(f, "{out} = select({or_else}, {then}, {cond});")
             }
             Instruction::Switch {
                 value,
@@ -762,14 +787,20 @@ for (var {i}: {i_ty} = {start}; {i} {cmp} {end}; {increment}) {{
                 f.write_str("}\n")
             }
             Instruction::BitwiseOr { lhs, rhs, out } => {
+                let lhs = lhs.fmt_cast_to(out.item());
+                let rhs = rhs.fmt_cast_to(out.item());
                 let out = out.fmt_left();
                 writeln!(f, "{out} = {lhs} | {rhs};")
             }
             Instruction::BitwiseAnd { lhs, rhs, out } => {
+                let lhs = lhs.fmt_cast_to(out.item());
+                let rhs = rhs.fmt_cast_to(out.item());
                 let out = out.fmt_left();
                 writeln!(f, "{out} = {lhs} & {rhs};")
             }
             Instruction::BitwiseXor { lhs, rhs, out } => {
+                let lhs = lhs.fmt_cast_to(out.item());
+                let rhs = rhs.fmt_cast_to(out.item());
                 let out = out.fmt_left();
                 writeln!(f, "{out} = {lhs} ^ {rhs};")
             }
@@ -786,38 +817,28 @@ for (var {i}: {i_ty} = {start}; {i} {cmp} {end}; {increment}) {{
                 writeln!(f, "{out} = reverseBits({input});")
             }
             Instruction::ShiftLeft { lhs, rhs, out } => {
+                let lhs = lhs.fmt_cast_to(out.item());
+                let rhs = rhs.fmt_cast_to(out.item().with_elem(Elem::U32));
                 let out = out.fmt_left();
-                writeln!(f, "{out} = {lhs} << u32({rhs});")
+                writeln!(f, "{out} = {lhs} << {rhs};")
             }
             Instruction::ShiftRight { lhs, rhs, out } => {
+                let lhs = lhs.fmt_cast_to(out.item());
+                let rhs = rhs.fmt_cast_to(out.item().with_elem(Elem::U32));
                 let out = out.fmt_left();
-                writeln!(f, "{out} = {lhs} >> u32({rhs});")
+                writeln!(f, "{out} = {lhs} >> {rhs};")
             }
             Instruction::BitwiseNot { input, out } => {
                 let out = out.fmt_left();
                 writeln!(f, "{out} = ~{input};")
             }
             Instruction::LeadingZeros { input, out } => {
-                let u32_ty = match input.item() {
-                    Item::Vec4(_) => Item::Vec4(Elem::U32),
-                    Item::Vec3(_) => Item::Vec3(Elem::U32),
-                    Item::Vec2(_) => Item::Vec2(Elem::U32),
-                    Item::Scalar(_) => Item::Scalar(Elem::U32),
-                };
-
-                let input = input.fmt_cast_to(u32_ty);
+                let input = input.fmt_cast_to(input.item().with_elem(Elem::U32));
                 let out = out.fmt_left();
                 writeln!(f, "{out} = countLeadingZeros({input});")
             }
             Instruction::FindFirstSet { input, out } => {
-                let u32_ty = match input.item() {
-                    Item::Vec4(_) => Item::Vec4(Elem::U32),
-                    Item::Vec3(_) => Item::Vec3(Elem::U32),
-                    Item::Vec2(_) => Item::Vec2(Elem::U32),
-                    Item::Scalar(_) => Item::Scalar(Elem::U32),
-                };
-
-                let input = input.fmt_cast_to(u32_ty);
+                let input = input.fmt_cast_to(input.item().with_elem(Elem::U32));
                 let out = out.fmt_left();
                 writeln!(f, "{out} = firstTrailingBit({input}) + 1;")
             }
@@ -944,85 +965,12 @@ fn comparison(
     op: &str,
     f: &mut std::fmt::Formatter<'_>,
 ) -> std::fmt::Result {
-    match out.item() {
-        Item::Vec4(_) => {
-            let lhs0 = lhs.index(0);
-            let lhs1 = lhs.index(1);
-            let lhs2 = lhs.index(2);
-            let lhs3 = lhs.index(3);
-            let rhs0 = rhs.index(0);
-            let rhs1 = rhs.index(1);
-            let rhs2 = rhs.index(2);
-            let rhs3 = rhs.index(3);
-            let out = out.fmt_left();
-
-            write!(
-                f,
-                "
-{out} = vec4({lhs0} {op} {rhs0}, {lhs1} {op} {rhs1}, {lhs2} {op} {rhs2}, {lhs3} {op} {rhs3});
-"
-            )
-        }
-        Item::Vec3(_) => {
-            let lhs0 = lhs.index(0);
-            let lhs1 = lhs.index(1);
-            let lhs2 = lhs.index(2);
-            let rhs0 = rhs.index(0);
-            let rhs1 = rhs.index(1);
-            let rhs2 = rhs.index(2);
-            let out = out.fmt_left();
-
-            write!(
-                f,
-                "
-{out} = vec3({lhs0} {op} {rhs0}, {lhs1} {op} {rhs1}, {lhs2} {op} {rhs2});
-"
-            )
-        }
-        Item::Vec2(_) => {
-            let lhs0 = lhs.index(0);
-            let lhs1 = lhs.index(1);
-            let rhs0 = rhs.index(0);
-            let rhs1 = rhs.index(1);
-            let out = out.fmt_left();
-
-            write!(
-                f,
-                "
-{out} = vec2({lhs0} {op} {rhs0}, {lhs1} {op} {rhs1});
-"
-            )
-        }
-        Item::Scalar(_) => match rhs.item() {
-            Item::Scalar(_) => {
-                let out = out.fmt_left();
-                writeln!(f, "{out} = {lhs} {op} {rhs};")
-            }
-            _ => panic!("Can only compare a scalar when the output is a scalar"),
-        },
-    }
+    let item = out.item().with_elem(lhs.elem());
+    let lhs = lhs.fmt_cast_to(item);
+    let rhs = rhs.fmt_cast_to(item);
+    let out = out.fmt_left();
+    writeln!(f, "{out} = {lhs} {op} {rhs};")
 }
-
-// fn unroll<
-//     const N: usize,
-//     F: Fn(&mut core::fmt::Formatter<'_>, [IndexedVariable; N]) -> core::fmt::Result,
-// >(
-//     f: &mut core::fmt::Formatter<'_>,
-//     vectorization_factor: usize,
-//     variables: [&Variable; N],
-//     func: F,
-// ) -> core::fmt::Result {
-//     for i in 0..vectorization_factor {
-//         let mut tmp = Vec::with_capacity(N);
-//         for var in variables.iter().take(N) {
-//             tmp.push(var.index(i));
-//         }
-//         let vars = tmp.try_into().unwrap();
-
-//         func(f, vars)?;
-//     }
-//     Ok(())
-// }
 
 struct IndexOffset {
     var: Variable,
@@ -1091,16 +1039,16 @@ fn index(
         };
 
         // Check for bounds.
-        if let Some(ind) = index {
-            if let Some(len) = len {
-                // Note: This is technically not 100% allowed. According to the WebGPU specification,
-                // any OOB access is a "dynamic error" which allows "many possible outcomes". In practice,
-                // both wgpu and Dawn handle this by either returning dummy data or clamping the index
-                // to valid bounds. This means it's harmless to use in a select.
-                let out_item = out.item();
-                value = format!("select({out_item}(0), {value}, {ind} < {len})");
-            };
-        }
+        if let Some(ind) = index
+            && let Some(len) = len
+        {
+            // Note: This is technically not 100% allowed. According to the WebGPU specification,
+            // any OOB access is a "dynamic error" which allows "many possible outcomes". In practice,
+            // both wgpu and Dawn handle this by either returning dummy data or clamping the index
+            // to valid bounds. This means it's harmless to use in a select.
+            let out_item = out.item();
+            value = format!("select({out_item}(0), {value}, {ind} < {len})");
+        };
 
         let out = out.fmt_left();
         writeln!(f, "{out} = {value};")

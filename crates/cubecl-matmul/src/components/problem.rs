@@ -2,7 +2,7 @@ use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::{Ident, MatmulProblemSize};
+use super::{MatmulIdent, MatmulProblemSize};
 
 #[derive(Clone, Debug)]
 /// Description of a matmul problem to solve, regardless of actual data
@@ -17,6 +17,8 @@ pub struct MatmulProblem {
     pub lhs_batches: Vec<usize>,
     /// Batch shape for Rhs tensor
     pub rhs_batches: Vec<usize>,
+    /// Batch shape for Out tensor
+    pub out_batches: Vec<usize>,
     /// Memory layout of the Lhs matrix.
     pub lhs_layout: MatrixLayout,
     /// Memory layout of the Rhs matrix.
@@ -41,21 +43,21 @@ impl MatmulProblem {
 
     /// Returns the shape of the identified tensor, inferred by the problem definition
     #[allow(unused)]
-    pub(crate) fn shape(&self, ident: Ident) -> Vec<usize> {
+    pub(crate) fn shape(&self, ident: MatmulIdent) -> Vec<usize> {
         match ident {
-            Ident::Lhs => self
+            MatmulIdent::Lhs => self
                 .lhs_batches
                 .iter()
                 .cloned()
                 .chain(vec![self.m, self.k])
                 .collect(),
-            Ident::Rhs => self
+            MatmulIdent::Rhs => self
                 .rhs_batches
                 .iter()
                 .cloned()
                 .chain(vec![self.k, self.n])
                 .collect(),
-            Ident::Out => self
+            MatmulIdent::Out => self
                 .output_batch_dims()
                 .iter()
                 .cloned()

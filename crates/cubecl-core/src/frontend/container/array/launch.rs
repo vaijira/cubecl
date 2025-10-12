@@ -1,14 +1,13 @@
-use std::{marker::PhantomData, num::NonZero};
+use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     Runtime,
     compute::{KernelBuilder, KernelLauncher},
-    ir::{Id, Item, Vectorization},
+    ir::{Id, LineSize, Type},
     prelude::{
-        ArgSettings, CompilationArg, CubePrimitive, ExpandElementTyped, LaunchArg, LaunchArgExpand,
-        TensorHandleRef,
+        ArgSettings, CompilationArg, CubePrimitive, ExpandElementTyped, LaunchArg, TensorHandleRef,
     },
 };
 
@@ -17,7 +16,7 @@ use super::Array;
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct ArrayCompilationArg {
     pub inplace: Option<Id>,
-    pub vectorisation: Vectorization,
+    pub line_size: LineSize,
 }
 
 impl CompilationArg for ArrayCompilationArg {}
@@ -30,43 +29,13 @@ pub struct ArrayHandleRef<'a, R: Runtime> {
     runtime: PhantomData<R>,
 }
 
-impl<C: CubePrimitive> LaunchArgExpand for Array<C> {
-    type CompilationArg = ArrayCompilationArg;
-
-    fn expand(
-        arg: &Self::CompilationArg,
-        builder: &mut KernelBuilder,
-    ) -> ExpandElementTyped<Array<C>> {
-        builder
-            .input_array(Item::vectorized(
-                C::as_elem(&builder.scope),
-                arg.vectorisation,
-            ))
-            .into()
-    }
-    fn expand_output(
-        arg: &Self::CompilationArg,
-        builder: &mut KernelBuilder,
-    ) -> ExpandElementTyped<Array<C>> {
-        match arg.inplace {
-            Some(id) => builder.inplace_output(id).into(),
-            None => builder
-                .output_array(Item::vectorized(
-                    C::as_elem(&builder.scope),
-                    arg.vectorisation,
-                ))
-                .into(),
-        }
-    }
-}
-
 pub enum ArrayArg<'a, R: Runtime> {
     /// The array is passed with an array handle.
     Handle {
         /// The array handle.
         handle: ArrayHandleRef<'a, R>,
         /// The vectorization factor.
-        vectorization_factor: u8,
+        line_size: u8,
     },
     /// The array is aliasing another input array.
     Alias {
@@ -90,7 +59,7 @@ impl<'a, R: Runtime> ArrayArg<'a, R> {
     pub unsafe fn from_raw_parts<E: CubePrimitive>(
         handle: &'a cubecl_runtime::server::Handle,
         length: usize,
-        vectorization_factor: u8,
+        line_size: u8,
     ) -> Self {
         unsafe {
             ArrayArg::Handle {
@@ -99,7 +68,7 @@ impl<'a, R: Runtime> ArrayArg<'a, R> {
                     length,
                     E::size().expect("Element should have a size"),
                 ),
-                vectorization_factor,
+                line_size,
             }
         }
     }
@@ -112,13 +81,13 @@ impl<'a, R: Runtime> ArrayArg<'a, R> {
     pub unsafe fn from_raw_parts_and_size(
         handle: &'a cubecl_runtime::server::Handle,
         length: usize,
-        vectorization_factor: u8,
+        line_size: u8,
         elem_size: usize,
     ) -> Self {
         unsafe {
             ArrayArg::Handle {
                 handle: ArrayHandleRef::from_raw_parts(handle, length, elem_size),
-                vectorization_factor,
+                line_size,
             }
         }
     }
@@ -159,20 +128,38 @@ impl<'a, R: Runtime> ArrayHandleRef<'a, R> {
 
 impl<C: CubePrimitive> LaunchArg for Array<C> {
     type RuntimeArg<'a, R: Runtime> = ArrayArg<'a, R>;
+    type CompilationArg = ArrayCompilationArg;
 
     fn compilation_arg<R: Runtime>(runtime_arg: &Self::RuntimeArg<'_, R>) -> Self::CompilationArg {
         match runtime_arg {
-            ArrayArg::Handle {
-                vectorization_factor,
-                ..
-            } => ArrayCompilationArg {
+            ArrayArg::Handle { line_size, .. } => ArrayCompilationArg {
                 inplace: None,
-                vectorisation: Vectorization::Some(NonZero::new(*vectorization_factor).unwrap()),
+                line_size: *line_size as u32,
             },
             ArrayArg::Alias { input_pos } => ArrayCompilationArg {
                 inplace: Some(*input_pos as Id),
-                vectorisation: Vectorization::None,
+                line_size: 0,
             },
+        }
+    }
+
+    fn expand(
+        arg: &Self::CompilationArg,
+        builder: &mut KernelBuilder,
+    ) -> ExpandElementTyped<Array<C>> {
+        builder
+            .input_array(Type::new(C::as_type(&builder.scope)).line(arg.line_size))
+            .into()
+    }
+    fn expand_output(
+        arg: &Self::CompilationArg,
+        builder: &mut KernelBuilder,
+    ) -> ExpandElementTyped<Array<C>> {
+        match arg.inplace {
+            Some(id) => builder.inplace_output(id).into(),
+            None => builder
+                .output_array(Type::new(C::as_type(&builder.scope)).line(arg.line_size))
+                .into(),
         }
     }
 }

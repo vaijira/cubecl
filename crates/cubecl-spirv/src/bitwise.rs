@@ -1,4 +1,7 @@
-use cubecl_core as cubecl;
+use cubecl_core::{
+    self as cubecl,
+    ir::{ElemType, Operator},
+};
 use cubecl_core::{comptime, ir as core, prelude::*};
 use cubecl_core::{cube, ir::Bitwise};
 
@@ -6,6 +9,11 @@ use crate::{SpirvCompiler, SpirvTarget};
 
 impl<T: SpirvTarget> SpirvCompiler<T> {
     pub fn compile_bitwise(&mut self, op: Bitwise, out: Option<core::Variable>, uniform: bool) {
+        if let Some(op) = bool_op(&op) {
+            self.compile_operator(op, out, uniform);
+            return;
+        }
+
         let out = out.unwrap();
         match op {
             Bitwise::BitwiseAnd(op) => {
@@ -50,7 +58,7 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                 });
             }
             Bitwise::LeadingZeros(op) => {
-                let width = op.input.item.elem.size() as u32 * 8;
+                let width = op.input.ty.storage_type().size() as u32 * 8;
                 self.compile_unary_op_cast(op, out, uniform, |b, out_ty, ty, input, out| {
                     // Indices are zero based, so subtract 1
                     let width = out_ty.const_u32(b, width - 1);
@@ -71,6 +79,35 @@ impl<T: SpirvTarget> SpirvCompiler<T> {
                 });
             }
         }
+    }
+}
+
+/// Map bitwise on boolean to logical, since bitwise ops aren't allowed in Vulkan. This fixes the
+/// case of
+/// ```ignore
+/// let a = true;
+/// for shape in 0..dims {
+///     a |= shape < width;
+/// }
+/// ```
+///
+/// Rust maps this to logical and/or internally, but the macro only sees the bitwise op.
+fn bool_op(bitwise: &Bitwise) -> Option<Operator> {
+    match bitwise {
+        Bitwise::BitwiseAnd(op)
+            if op.lhs.elem_type() == ElemType::Bool || op.rhs.elem_type() == ElemType::Bool =>
+        {
+            Some(Operator::And(op.clone()))
+        }
+        Bitwise::BitwiseOr(op)
+            if op.lhs.elem_type() == ElemType::Bool || op.rhs.elem_type() == ElemType::Bool =>
+        {
+            Some(Operator::Or(op.clone()))
+        }
+        Bitwise::BitwiseNot(op) if op.input.elem_type() == ElemType::Bool => {
+            Some(Operator::Not(op.clone()))
+        }
+        _ => None,
     }
 }
 

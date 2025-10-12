@@ -1,14 +1,14 @@
 use cubecl_core as cubecl;
 
-use cubecl_core::{AutotuneKey, ir::Elem};
+use cubecl_core::{AutotuneKey, ir::ElemType};
 use serde::{Deserialize, Serialize};
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize, AutotuneKey)]
 /// Autotune key representative of reduce versions
 pub struct ReduceAutotuneKey {
-    elem_input: Elem,
-    elem_output: Elem,
-    elem_acc: Elem,
+    elem_input: ElemType,
+    elem_output: ElemType,
+    elem_acc: ElemType,
     potential_line_size: u8,
     axis_is_contiguous: bool,
     #[autotune(anchor(exp(min = 16, max = 4096)))]
@@ -19,9 +19,9 @@ pub struct ReduceAutotuneKey {
 
 impl ReduceAutotuneKey {
     pub fn generate(
-        elem_input: Elem,
-        elem_output: Elem,
-        elem_acc: Elem,
+        elem_input: ElemType,
+        elem_output: ElemType,
+        elem_acc: ElemType,
         input_shape: &[usize],
         axis_is_contiguous: bool,
         axis: usize,
@@ -57,7 +57,9 @@ impl ReduceAutotuneKey {
         let mut potential_line_size = 1;
         let max_bytes_in_line = 16; // 128 bits
         //
-        while shape % 2 == 0 && potential_line_size as usize * elem_size < max_bytes_in_line {
+        while shape.is_multiple_of(2)
+            && potential_line_size as usize * elem_size < max_bytes_in_line
+        {
             potential_line_size *= 2;
             shape /= 2;
         }

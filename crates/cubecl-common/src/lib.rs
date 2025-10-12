@@ -12,6 +12,16 @@ extern crate derive_new;
 /// std environments.
 pub mod rand;
 
+/// Device module.
+pub mod device;
+
+/// Map utilities and implementations.
+pub mod map;
+
+/// Utilities module to manipulate bytes.
+#[cfg(feature = "serde")]
+pub mod bytes;
+
 /// Stub module contains types for stubs for non-std environments and for std environments.
 pub mod stub;
 

@@ -1,9 +1,8 @@
-use core::num::NonZero;
 use core::{fmt::Display, hash::Hash};
 
-use crate::{BarrierLevel, TypeHash};
+use crate::{BarrierLevel, StorageType, TypeHash};
 
-use super::{Elem, FloatKind, IntKind, Item, Matrix, UIntKind};
+use super::{ElemType, FloatKind, IntKind, Matrix, Type, UIntKind};
 use float_ord::FloatOrd;
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -11,33 +10,37 @@ use float_ord::FloatOrd;
 #[allow(missing_docs)]
 pub struct Variable {
     pub kind: VariableKind,
-    pub item: Item,
+    pub ty: Type,
 }
 
 impl Variable {
-    pub fn new(kind: VariableKind, item: Item) -> Self {
-        Self { kind, item }
+    pub fn new(kind: VariableKind, item: Type) -> Self {
+        Self { kind, ty: item }
     }
 
     pub fn builtin(builtin: Builtin) -> Self {
         Self::new(
             VariableKind::Builtin(builtin),
-            Item::new(Elem::UInt(UIntKind::U32)),
+            Type::scalar(ElemType::UInt(UIntKind::U32)),
         )
     }
 
     pub fn constant(scalar: ConstantScalarValue) -> Self {
         let elem = match scalar {
-            ConstantScalarValue::Int(_, int_kind) => Elem::Int(int_kind),
-            ConstantScalarValue::Float(_, float_kind) => Elem::Float(float_kind),
-            ConstantScalarValue::UInt(_, kind) => Elem::UInt(kind),
-            ConstantScalarValue::Bool(_) => Elem::Bool,
+            ConstantScalarValue::Int(_, int_kind) => ElemType::Int(int_kind),
+            ConstantScalarValue::Float(_, float_kind) => ElemType::Float(float_kind),
+            ConstantScalarValue::UInt(_, kind) => ElemType::UInt(kind),
+            ConstantScalarValue::Bool(_) => ElemType::Bool,
         };
-        Self::new(VariableKind::ConstantScalar(scalar), Item::new(elem))
+        Self::new(VariableKind::ConstantScalar(scalar), Type::scalar(elem))
     }
 
-    pub fn elem(&self) -> Elem {
-        self.item.elem
+    pub fn elem_type(&self) -> ElemType {
+        self.ty.elem_type()
+    }
+
+    pub fn storage_type(&self) -> StorageType {
+        self.ty.storage_type()
     }
 }
 
@@ -49,10 +52,12 @@ pub enum VariableKind {
     GlobalInputArray(Id),
     GlobalOutputArray(Id),
     GlobalScalar(Id),
-    TensorMap(Id),
+    TensorMapInput(Id),
+    TensorMapOutput(Id),
     LocalArray {
         id: Id,
         length: u32,
+        unroll_factor: u32,
     },
     LocalMut {
         id: Id,
@@ -68,10 +73,12 @@ pub enum VariableKind {
     ConstantArray {
         id: Id,
         length: u32,
+        unroll_factor: u32,
     },
     SharedMemory {
         id: Id,
         length: u32,
+        unroll_factor: u32,
         alignment: Option<u32>,
     },
     Matrix {
@@ -81,18 +88,17 @@ pub enum VariableKind {
     Builtin(Builtin),
     Pipeline {
         id: Id,
-        item: Item,
         num_stages: u8,
     },
     Barrier {
         id: Id,
-        item: Item,
         level: BarrierLevel,
     },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TypeHash, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum Builtin {
     UnitPos,
     UnitPosX,
@@ -132,7 +138,8 @@ impl Variable {
     pub fn is_immutable(&self) -> bool {
         match self.kind {
             VariableKind::GlobalOutputArray { .. } => false,
-            VariableKind::TensorMap(_) => false,
+            VariableKind::TensorMapInput(_) => true,
+            VariableKind::TensorMapOutput(_) => false,
             VariableKind::LocalMut { .. } => false,
             VariableKind::SharedMemory { .. } => false,
             VariableKind::Matrix { .. } => false,
@@ -242,13 +249,17 @@ impl Hash for ConstantScalarValue {
 
 impl ConstantScalarValue {
     /// Returns the element type of the scalar.
-    pub fn elem(&self) -> Elem {
+    pub fn elem_type(&self) -> ElemType {
         match self {
-            ConstantScalarValue::Int(_, kind) => Elem::Int(*kind),
-            ConstantScalarValue::Float(_, kind) => Elem::Float(*kind),
-            ConstantScalarValue::UInt(_, kind) => Elem::UInt(*kind),
-            ConstantScalarValue::Bool(_) => Elem::Bool,
+            ConstantScalarValue::Int(_, kind) => ElemType::Int(*kind),
+            ConstantScalarValue::Float(_, kind) => ElemType::Float(*kind),
+            ConstantScalarValue::UInt(_, kind) => ElemType::UInt(*kind),
+            ConstantScalarValue::Bool(_) => ElemType::Bool,
         }
+    }
+
+    pub fn storage_type(&self) -> StorageType {
+        self.elem_type().into()
     }
 
     /// Returns the value of the scalar as a usize.
@@ -365,51 +376,54 @@ impl ConstantScalarValue {
         }
     }
 
-    pub fn cast_to(&self, other: Elem) -> ConstantScalarValue {
-        match (self, other) {
-            (ConstantScalarValue::Int(val, _), Elem::Float(float_kind)) => {
+    pub fn cast_to(&self, other: StorageType) -> ConstantScalarValue {
+        match (self, other.elem_type()) {
+            (ConstantScalarValue::Int(val, _), ElemType::Float(float_kind)) => {
                 ConstantScalarValue::Float(*val as f64, float_kind)
             }
-            (ConstantScalarValue::Int(val, _), Elem::Int(int_kind)) => {
+            (ConstantScalarValue::Int(val, _), ElemType::Int(int_kind)) => {
                 ConstantScalarValue::Int(*val, int_kind)
             }
-            (ConstantScalarValue::Int(val, _), Elem::UInt(kind)) => {
+            (ConstantScalarValue::Int(val, _), ElemType::UInt(kind)) => {
                 ConstantScalarValue::UInt(*val as u64, kind)
             }
-            (ConstantScalarValue::Int(val, _), Elem::Bool) => ConstantScalarValue::Bool(*val == 1),
-            (ConstantScalarValue::Float(val, _), Elem::Float(float_kind)) => {
+            (ConstantScalarValue::Int(val, _), ElemType::Bool) => {
+                ConstantScalarValue::Bool(*val == 1)
+            }
+            (ConstantScalarValue::Float(val, _), ElemType::Float(float_kind)) => {
                 ConstantScalarValue::Float(*val, float_kind)
             }
-            (ConstantScalarValue::Float(val, _), Elem::Int(int_kind)) => {
+            (ConstantScalarValue::Float(val, _), ElemType::Int(int_kind)) => {
                 ConstantScalarValue::Int(*val as i64, int_kind)
             }
-            (ConstantScalarValue::Float(val, _), Elem::UInt(kind)) => {
+            (ConstantScalarValue::Float(val, _), ElemType::UInt(kind)) => {
                 ConstantScalarValue::UInt(*val as u64, kind)
             }
-            (ConstantScalarValue::Float(val, _), Elem::Bool) => {
+            (ConstantScalarValue::Float(val, _), ElemType::Bool) => {
                 ConstantScalarValue::Bool(*val == 0.0)
             }
-            (ConstantScalarValue::UInt(val, _), Elem::Float(float_kind)) => {
+            (ConstantScalarValue::UInt(val, _), ElemType::Float(float_kind)) => {
                 ConstantScalarValue::Float(*val as f64, float_kind)
             }
-            (ConstantScalarValue::UInt(val, _), Elem::Int(int_kind)) => {
+            (ConstantScalarValue::UInt(val, _), ElemType::Int(int_kind)) => {
                 ConstantScalarValue::Int(*val as i64, int_kind)
             }
-            (ConstantScalarValue::UInt(val, _), Elem::UInt(kind)) => {
+            (ConstantScalarValue::UInt(val, _), ElemType::UInt(kind)) => {
                 ConstantScalarValue::UInt(*val, kind)
             }
-            (ConstantScalarValue::UInt(val, _), Elem::Bool) => ConstantScalarValue::Bool(*val == 1),
-            (ConstantScalarValue::Bool(val), Elem::Float(float_kind)) => {
+            (ConstantScalarValue::UInt(val, _), ElemType::Bool) => {
+                ConstantScalarValue::Bool(*val == 1)
+            }
+            (ConstantScalarValue::Bool(val), ElemType::Float(float_kind)) => {
                 ConstantScalarValue::Float(*val as u32 as f64, float_kind)
             }
-            (ConstantScalarValue::Bool(val), Elem::Int(int_kind)) => {
+            (ConstantScalarValue::Bool(val), ElemType::Int(int_kind)) => {
                 ConstantScalarValue::Int(*val as i64, int_kind)
             }
-            (ConstantScalarValue::Bool(val), Elem::UInt(kind)) => {
+            (ConstantScalarValue::Bool(val), ElemType::UInt(kind)) => {
                 ConstantScalarValue::UInt(*val as u64, kind)
             }
-            (ConstantScalarValue::Bool(val), Elem::Bool) => ConstantScalarValue::Bool(*val),
-            _ => unreachable!(),
+            (ConstantScalarValue::Bool(val), ElemType::Bool) => ConstantScalarValue::Bool(*val),
         }
     }
 }
@@ -443,15 +457,16 @@ impl Display for ConstantScalarValue {
 }
 
 impl Variable {
-    pub fn vectorization_factor(&self) -> u8 {
-        self.item.vectorization.map(NonZero::get).unwrap_or(1u8)
+    pub fn line_size(&self) -> u32 {
+        self.ty.line_size()
     }
 
     pub fn index(&self) -> Option<Id> {
         match self.kind {
             VariableKind::GlobalInputArray(id)
             | VariableKind::GlobalOutputArray(id)
-            | VariableKind::TensorMap(id)
+            | VariableKind::TensorMapInput(id)
+            | VariableKind::TensorMapOutput(id)
             | VariableKind::GlobalScalar(id)
             | VariableKind::LocalMut { id, .. }
             | VariableKind::Versioned { id, .. }
@@ -478,7 +493,8 @@ impl Display for Variable {
             VariableKind::GlobalInputArray(id) => write!(f, "input({id})"),
             VariableKind::GlobalOutputArray(id) => write!(f, "output({id})"),
             VariableKind::GlobalScalar(id) => write!(f, "scalar({id})"),
-            VariableKind::TensorMap(id) => write!(f, "tensor_map({id})"),
+            VariableKind::TensorMapInput(id) => write!(f, "tensor_map({id})"),
+            VariableKind::TensorMapOutput(id) => write!(f, "tensor_map({id})"),
             VariableKind::ConstantScalar(constant) => write!(f, "{constant}"),
             VariableKind::LocalMut { id } => write!(f, "local({id})"),
             VariableKind::Versioned { id, version } => {
