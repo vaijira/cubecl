@@ -15,8 +15,8 @@ use crate::{
         global::{
             GlobalConfig,
             memory::{
-                BatchedGlobalLayout, BatchedGlobalLayoutLaunch, SimpleTmaGlobalLayout,
-                SimpleTmaGlobalLayoutLaunch,
+                BatchedGlobalLayout, BatchedGlobalLayoutLaunch, BatchedGlobalScaleLayout,
+                SimpleTmaGlobalLayout, SimpleTmaGlobalLayoutLaunch,
             },
         },
     },
@@ -26,7 +26,7 @@ use crate::{
 /// output (not fused).
 pub trait ConcreteInputsFactory: LaunchArg {
     fn create<'a, R: Runtime>(
-        client: &ComputeClient<R::Server, R::Channel>,
+        client: &ComputeClient<R::Server>,
         lhs: &'a MatmulInputHandleRef<'a, R>,
         rhs: &'a MatmulInputHandleRef<'a, R>,
         selection: &MatmulSelection,
@@ -40,7 +40,7 @@ pub trait ConcreteInputsFactory: LaunchArg {
 /// output (not fused).
 pub trait ConcreteOutputFactory: LaunchArg {
     fn create<'a, R: Runtime>(
-        client: &ComputeClient<R::Server, R::Channel>,
+        client: &ComputeClient<R::Server>,
         out: &'a TensorHandleRef<'a, R>,
         selection: &MatmulSelection,
         problem: &MatmulProblem,
@@ -119,7 +119,7 @@ impl<Lhs: Numeric, Rhs: Numeric, Acc: Numeric> ConcreteInputsFactory
     for TensorInputs<Lhs, Rhs, Acc>
 {
     fn create<'a, R: Runtime>(
-        client: &ComputeClient<R::Server, R::Channel>,
+        client: &ComputeClient<R::Server>,
         lhs: &'a MatmulInputHandleRef<'a, R>,
         rhs: &'a MatmulInputHandleRef<'a, R>,
         _selection: &MatmulSelection,
@@ -128,19 +128,44 @@ impl<Lhs: Numeric, Rhs: Numeric, Acc: Numeric> ConcreteInputsFactory
         config: impl BatchConfig,
     ) -> Self::RuntimeArg<'a, R> {
         let config = config.global_config();
-        let view = |handle, ident, line_size| {
-            let layout = BatchedGlobalLayoutLaunch::from_handle(
-                client,
-                handle,
-                problem,
-                config.global_memory_config(ident),
-            );
-            ViewArg::new::<BatchedGlobalLayout>(handle.as_array_arg(line_size), layout)
+        let view = |handle: &'a MatmulInputHandleRef<'a, R>, ident, line_size| match handle {
+            MatmulInputHandleRef::Normal(handle) => {
+                let layout = BatchedGlobalLayoutLaunch::from_handle(
+                    client,
+                    handle,
+                    problem,
+                    config.global_memory_config(ident),
+                );
+                ViewArg::new::<BatchedGlobalLayout>(handle.as_array_arg(line_size), layout)
+            }
+            MatmulInputHandleRef::Quantized {
+                data,
+                scale,
+                shape,
+                scheme,
+            } => {
+                let (data_layout, scales_layout) = BatchedGlobalLayoutLaunch::from_quantized_handle(
+                    client,
+                    data,
+                    scale,
+                    shape,
+                    problem,
+                    config.global_memory_config(ident),
+                    **scheme,
+                );
+                let data_view =
+                    ViewArg::new::<BatchedGlobalLayout>(data.as_array_arg(line_size), data_layout);
+                let scales_view = ViewArg::new::<BatchedGlobalScaleLayout>(
+                    scale.as_array_arg(line_size),
+                    scales_layout,
+                );
+                ViewArg::new_quantized(data_view, scales_view, **scheme)
+            }
         };
 
         TensorInputsLaunch::new(
-            view(lhs.data(), MatmulIdent::Lhs, line_sizes.lhs),
-            view(rhs.data(), MatmulIdent::Rhs, line_sizes.rhs),
+            view(lhs, MatmulIdent::Lhs, line_sizes.lhs),
+            view(rhs, MatmulIdent::Rhs, line_sizes.rhs),
             CubeOptionArgs::None,
         )
     }
@@ -148,7 +173,7 @@ impl<Lhs: Numeric, Rhs: Numeric, Acc: Numeric> ConcreteInputsFactory
 
 impl<EG: Numeric> ConcreteOutputFactory for View<Line<EG>, Coords3d, ReadWrite> {
     fn create<'a, R: Runtime>(
-        client: &ComputeClient<R::Server, R::Channel>,
+        client: &ComputeClient<R::Server>,
         out: &'a TensorHandleRef<'a, R>,
         _selection: &MatmulSelection,
         problem: &MatmulProblem,
@@ -231,7 +256,7 @@ impl<Lhs: Numeric, Rhs: Numeric, EO: Numeric> ConcreteInputsFactory
     for TensorMapInputs<Lhs, Rhs, EO>
 {
     fn create<'a, R: Runtime>(
-        _client: &ComputeClient<R::Server, R::Channel>,
+        _client: &ComputeClient<R::Server>,
         lhs_handle: &'a MatmulInputHandleRef<'a, R>,
         rhs_handle: &'a MatmulInputHandleRef<'a, R>,
         selection: &MatmulSelection,

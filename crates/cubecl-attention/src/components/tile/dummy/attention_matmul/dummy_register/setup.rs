@@ -24,7 +24,7 @@ impl AttentionMatmulFamily for DummyRegisterAttentionMatmul {
     }
 
     fn setup<AP: AttentionPrecision, R: cubecl_core::Runtime>(
-        _client: &ComputeClient<R::Server, R::Channel>,
+        _client: &ComputeClient<R::Server>,
         problem: &AttentionProblem,
         selection: &AttentionSelection,
         line_sizes: &AttentionLineSizes,
@@ -38,6 +38,8 @@ impl AttentionMatmulFamily for DummyRegisterAttentionMatmul {
             line_sizes.key as u32,
             !(problem.seq_kv as u32).is_multiple_of(selection.tiling_scheme.tile_size.seq_kv),
             selection.two_rows_in_array_tile,
+            problem.causal,
+            problem.masked,
         )
     }
 }
