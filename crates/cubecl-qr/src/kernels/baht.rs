@@ -99,7 +99,7 @@ fn small_house<F: Float>(
 }
 
 fn launch_small_house<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     rows: u32,
     cols: u32,
@@ -239,7 +239,7 @@ fn small_left_r_update<F: Float>(
 }
 
 fn launch_small_left_r_update<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     rows: u32,
     size_tiles: u32,
@@ -373,7 +373,7 @@ fn medium_sub_v_beta_rt_v<F: Float>(
 }
 
 fn launch_medium_left_r_update<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     rows: u32,
     size_tiles: u32,
@@ -598,7 +598,7 @@ fn update_wy_t<F: Float>(
 }
 
 fn launch_medium_vb_to_w<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     rows: u32,
     size_tiles: u32,
@@ -729,7 +729,7 @@ fn small_qwy_t<F: Float>(
 }
 
 fn launch_small_qwy_t<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     dim: u32,
     size_tiles: u32,
@@ -785,7 +785,7 @@ fn small_q_update<F: Float>(
 }
 
 fn launch_small_q_update<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     dim: u32,
     size_tiles: u32,
@@ -840,7 +840,7 @@ fn small_yw_t<F: Float>(
 }
 
 fn launch_small_yw_t<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     rows: u32,
     size_tiles: u32,
@@ -900,7 +900,7 @@ fn small_yw_tc<F: Float>(
 }
 
 fn launch_small_yw_tc<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     rows: u32,
     cols: u32,
@@ -962,7 +962,7 @@ fn small_r_add_yw_tc<F: Float>(
 }
 
 fn launch_small_r_add_yw_tc<R: Runtime, F: Float>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     line_size: u8,
     rows: u32,
     cols: u32,
@@ -997,7 +997,7 @@ fn launch_small_r_add_yw_tc<R: Runtime, F: Float>(
 
 /// line_indexaunch
 pub fn launch_ref<R: Runtime, E: Float + CubeElement>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {
@@ -1005,7 +1005,7 @@ pub fn launch_ref<R: Runtime, E: Float + CubeElement>(
 }
 
 pub fn launch<R: Runtime, E: Float + CubeElement>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {

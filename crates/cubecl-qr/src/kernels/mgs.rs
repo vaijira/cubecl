@@ -241,7 +241,7 @@ fn mgs_normalize_reduce<F: Float>(
 }
 
 pub fn launch_ref<R: Runtime, E: Float + CubeElement>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {
@@ -249,7 +249,7 @@ pub fn launch_ref<R: Runtime, E: Float + CubeElement>(
 }
 
 pub fn launch<R: Runtime, E: Float + CubeElement>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {

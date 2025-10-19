@@ -63,7 +63,7 @@ pub fn givens_rotation_by_column<F: Float>(
 
 /// Launch
 pub fn launch_ref<R: Runtime, E: Float + CubeElement>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {
@@ -71,7 +71,7 @@ pub fn launch_ref<R: Runtime, E: Float + CubeElement>(
 }
 
 pub fn launch<R: Runtime, E: Float + CubeElement>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {
@@ -94,7 +94,6 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
                 r.as_tensor_arg(vectorization_factor),
                 l.as_ref().as_tensor_arg(vectorization_factor),
             );
-
             givens_rotation_by_column::launch_unchecked::<E, R>(
                 client,
                 cube_count.clone(),
@@ -104,6 +103,9 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
                 q.as_tensor_arg(vectorization_factor),
                 r.as_tensor_arg(vectorization_factor),
             );
+            let bytes = client.read_one(q.handle.clone());
+            let output = E::from_bytes(&bytes);
+            println!("Q iter {i} => {output:?}");
         }
     }
 }

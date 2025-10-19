@@ -37,7 +37,7 @@ pub enum Strategy {
 /// It launches QR decomposition kernel over a m x n matrix.
 pub fn launch<R: Runtime, EG: Float + CubeElement>(
     strategy: &Strategy,
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     a: &TensorHandle<R, EG>,
 ) -> Result<QRTuple<R, EG>, QRLaunchError> {
     launch_ref::<R, EG>(strategy, client, &a.as_ref())
@@ -45,20 +45,29 @@ pub fn launch<R: Runtime, EG: Float + CubeElement>(
 
 pub fn launch_ref<R: Runtime, EG: Float + CubeElement>(
     strategy: &Strategy,
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     a: &TensorHandleRef<R>,
 ) -> Result<QRTuple<R, EG>, QRLaunchError> {
     let (q, r) = match strategy {
         Strategy::ModifiedGramSchmidt => {
             let a_bytes = client.read_one(a.handle.clone());
             let a_handle = client.create(&a_bytes);
-            let q = TensorHandle::<R, EG>::new_contiguous(a.shape.into(), a_handle);
-            let r = TensorHandle::<R, EG>::zeros(client, a.shape.to_vec());
+            let q = TensorHandle::<R, EG>::new_contiguous(a.shape.to_vec(), a_handle);
+            let a_handle = client.create(EG::as_bytes(&vec![
+                EG::from_int(0);
+                a.shape.iter().product()
+            ]));
+            let r = TensorHandle::new_contiguous(a.shape.to_vec(), a_handle);
             mgs::launch_ref::<R, EG>(client, &q.as_ref(), &r.as_ref());
             (q, r)
         }
         Strategy::BlockedAcceleratedHouseholderReflectors => {
-            let q = TensorHandle::<R, EG>::empty(client, a.shape.to_vec());
+            let q_shape = vec![a.shape[0], a.shape[0]];
+            let q_handle = client.create(EG::as_bytes(&vec![
+                EG::from_int(0);
+                q_shape.iter().product()
+            ]));
+            let q = TensorHandle::new_contiguous(q_shape, q_handle);
             identity::launch(client, &q);
             let a_bytes = client.read_one(a.handle.clone());
             let a_handle = client.create(&a_bytes);
@@ -67,7 +76,12 @@ pub fn launch_ref<R: Runtime, EG: Float + CubeElement>(
             (q, r)
         }
         Strategy::CommonGivensRotations => {
-            let q = TensorHandle::<R, EG>::empty(client, a.shape.to_vec());
+            let q_shape = vec![a.shape[0], a.shape[0]];
+            let q_handle = client.create(EG::as_bytes(&vec![
+                EG::from_int(0);
+                q_shape.iter().product()
+            ]));
+            let q = TensorHandle::new_contiguous(q_shape, q_handle);
             identity::launch(client, &q);
             let a_bytes = client.read_one(a.handle.clone());
             let a_handle = client.create(&a_bytes);

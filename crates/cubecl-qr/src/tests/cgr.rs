@@ -6,7 +6,7 @@ use cubecl_matmul::tests::test_utils::assert_equals_approx;
 use cubecl_std::tensor::{TensorHandle, into_contiguous};
 
 fn tensorhandler_from_data<R: Runtime, F: Float + CubeElement>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     shape: Vec<usize>,
     data: &[F],
 ) -> TensorHandle<R, F> {
@@ -15,7 +15,7 @@ fn tensorhandler_from_data<R: Runtime, F: Float + CubeElement>(
 }
 
 fn transpose_matrix<R: Runtime, F: Float + CubeElement>(
-    client: &ComputeClient<R::Server, R::Channel>,
+    client: &ComputeClient<R::Server>,
     matrix: &mut TensorHandle<R, F>,
 ) -> TensorHandle<R, F> {
     matrix.strides.swap(1, 0);
@@ -38,6 +38,9 @@ pub fn test_qr_cgr<R: Runtime, F: Float + CubeElement + Display>(device: &R::Dev
     }
 
     let a = tensorhandler_from_data::<R, F>(&client, shape.clone(), &data);
+    let bytes = client.read_one_tensor(a.as_copy_descriptor());
+    let output = F::from_bytes(&bytes);
+    println!("A Output => {output:?}");
 
     let (mut q, r) =
         match crate::launch::<R, F>(&crate::Strategy::CommonGivensRotations, &client, &a) {
@@ -48,23 +51,29 @@ pub fn test_qr_cgr<R: Runtime, F: Float + CubeElement + Display>(device: &R::Dev
             ),
         };
 
-    let bytes = client.read_one(q.handle.clone());
+    let bytes = client.read_one_tensor(q.as_copy_descriptor());
     let output = F::from_bytes(&bytes);
     println!("Q Output => {output:?}");
 
-    let bytes = client.read_one(r.handle.clone());
+    let bytes = client.read_one_tensor(r.as_copy_descriptor());
     let output = F::from_bytes(&bytes);
     println!("R Output => {output:?}");
 
     let q_t = transpose_matrix(&client, &mut q);
-    let bytes = client.read_one(q_t.handle.clone());
+    let bytes = client.read_one_tensor(q_t.as_copy_descriptor());
     let output = F::from_bytes(&bytes);
     println!("Q Transposed Output => {output:?}");
 
     let out: TensorHandle<R, F> = TensorHandle::empty(&client, shape.clone());
-    cubecl_matmul::kernels::naive::launch::<R, F, F>(&client, q_t, r, &out.as_ref()).unwrap();
+    cubecl_matmul::kernels::naive::launch::<R, F, F>(
+        &client,
+        cubecl_matmul::MatmulInputHandle::Normal(q_t),
+        cubecl_matmul::MatmulInputHandle::Normal(r),
+        &out.as_ref(),
+    )
+    .unwrap();
 
-    let bytes = client.read_one(out.handle.clone());
+    let bytes = client.read_one_tensor(out.as_copy_descriptor());
     let output = F::from_bytes(&bytes);
     println!("Result Output => {output:?}");
 
