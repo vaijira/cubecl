@@ -4,7 +4,7 @@ use cubecl_core::{
     prelude::{Float, TensorHandleRef},
 };
 
-use cubecl_std::tensor::{TensorHandle, identity};
+use cubecl_std::tensor::{TensorHandle, identity, into_contiguous};
 
 use super::kernels::{QRLaunchError, baht, cgr, mgs};
 
@@ -53,21 +53,15 @@ pub fn launch_ref<R: Runtime, EG: Float + CubeElement>(
             let a_bytes = client.read_one(a.handle.clone());
             let a_handle = client.create(&a_bytes);
             let q = TensorHandle::<R, EG>::new_contiguous(a.shape.to_vec(), a_handle);
-            let a_handle = client.create(EG::as_bytes(&vec![
-                EG::from_int(0);
-                a.shape.iter().product()
-            ]));
-            let r = TensorHandle::new_contiguous(a.shape.to_vec(), a_handle);
+            let mut r = TensorHandle::zeros(client, a.shape.to_vec());
+            r.strides = vec![a.shape[0], 1];
             mgs::launch_ref::<R, EG>(client, &q.as_ref(), &r.as_ref());
             (q, r)
         }
         Strategy::BlockedAcceleratedHouseholderReflectors => {
             let q_shape = vec![a.shape[0], a.shape[0]];
-            let q_handle = client.create(EG::as_bytes(&vec![
-                EG::from_int(0);
-                q_shape.iter().product()
-            ]));
-            let q = TensorHandle::new_contiguous(q_shape, q_handle);
+            let mut q = TensorHandle::empty(client, q_shape);
+            q.strides = vec![a.shape[0], 1];
             identity::launch(client, &q);
             let a_bytes = client.read_one(a.handle.clone());
             let a_handle = client.create(&a_bytes);
@@ -77,11 +71,8 @@ pub fn launch_ref<R: Runtime, EG: Float + CubeElement>(
         }
         Strategy::CommonGivensRotations => {
             let q_shape = vec![a.shape[0], a.shape[0]];
-            let q_handle = client.create(EG::as_bytes(&vec![
-                EG::from_int(0);
-                q_shape.iter().product()
-            ]));
-            let q = TensorHandle::new_contiguous(q_shape, q_handle);
+            let mut q = TensorHandle::empty(client, q_shape);
+            q.strides = vec![a.shape[0], 1];
             identity::launch(client, &q);
             let a_bytes = client.read_one(a.handle.clone());
             let a_handle = client.create(&a_bytes);

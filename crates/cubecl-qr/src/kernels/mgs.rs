@@ -253,7 +253,7 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {
-    let vectorization_factor = 1;
+    let line_size = 1;
     let block_size = 32;
     let cube_dim = CubeDim::new_1d(block_size);
     let num_elems_per_cube = cube_dim.num_elems();
@@ -281,9 +281,8 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
     }*/
 
     for pivot in 0..q.shape[1] {
-        let pivot_norm_l2 = unsafe {
-            ArrayArg::<R>::from_raw_parts::<E>(&handle_pivot_norm_l2, 1, vectorization_factor)
-        };
+        let pivot_norm_l2 =
+            unsafe { ArrayArg::<R>::from_raw_parts::<E>(&handle_pivot_norm_l2, 1, line_size) };
         let block_size_log2 = block_size - block_size.leading_zeros(); // ceil of log2
         let cube_count = CubeCount::new_1d((q.shape[1] - pivot) as u32);
         /* println!(
@@ -299,8 +298,8 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
                 client,
                 cube_count.clone(),
                 cube_dim,
-                q.as_tensor_arg(vectorization_factor),
-                r.as_tensor_arg(vectorization_factor),
+                q.as_tensor_arg(line_size),
+                r.as_tensor_arg(line_size),
                 pivot_norm_l2,
                 ScalarArg::new(pivot as u32),
                 ScalarArg::new(rounds),
@@ -312,15 +311,14 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
     }
 
     let cube_count = CubeCount::new_1d(rounds);
-    let pivot_norm_l2 = unsafe {
-        ArrayArg::<R>::from_raw_parts::<E>(&handle_pivot_norm_l2, 1, vectorization_factor)
-    };
+    let pivot_norm_l2 =
+        unsafe { ArrayArg::<R>::from_raw_parts::<E>(&handle_pivot_norm_l2, 1, line_size) };
     unsafe {
         mgs_normalize::launch_unchecked::<E, R>(
             client,
             cube_count,
             cube_dim,
-            q.as_tensor_arg(vectorization_factor),
+            q.as_tensor_arg(line_size),
             pivot_norm_l2,
             ScalarArg::new((q.shape[1] - 1) as u32),
             ScalarArg::new(block_size),

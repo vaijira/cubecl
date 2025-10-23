@@ -4,6 +4,7 @@ use cubecl_core as cubecl;
 use cubecl_core::PLANE_DIM_APPROX;
 
 use cubecl_std::tensor::TensorHandle;
+use cubecl_std::tensor::into_contiguous;
 
 // Implementation follows GPU_dbl_blocked_houseqr method implementation
 // https://github.com/janverschelde/PHCpack/blob/master/src/GPU/Matrices/dbl_baqr_kernels.cu
@@ -25,13 +26,12 @@ use cubecl_std::tensor::TensorHandle;
 // Check too https://github.com/DrTimothyAldenDavis/SuiteSparse/blob/dev/SPQR/Source/SuiteSparseQR.cpp
 // Algorithm 980: Sparse QR Factorization on the GPU
 
-#[cube(launch_unchecked)]
+#[cube(launch)]
 fn small_house<F: Float>(
-    x0: &Array<F>,
-    x1: &Array<F>,
+    r: &Array<F>,
     dim: u32,
     dimline_indexlog2: u32,
-    v: &mut Tensor<F>,
+    v: &mut Array<F>,
     beta: &mut Array<F>,
     #[comptime] shared_memory_size: u32,
 ) {
@@ -45,7 +45,7 @@ fn small_house<F: Float>(
 
     let mut stopflag: bool = false;
 
-    shared_v[j] = x1[j]; // reading of vector into shared memory
+    shared_v[j] = r[j+1]; // reading of vector into shared memory
     product[j] = shared_v[j] * shared_v[j]; // for the 2-norm computation
 
     v[j + 1] = shared_v[j]; // copies x to v, in case beta is zero
@@ -76,11 +76,11 @@ fn small_house<F: Float>(
     }
     if j == 0 {
         // thread zero sets beta
-        let mu = F::sqrt((x0[0]) * (x0[0]) + product[0]);
-        let v0 = if x0[0] <= zero_constant {
-            x0[0] - mu
+        let mu = F::sqrt((r[0]) * (r[0]) + product[0]);
+        let v0 = if r[0] <= zero_constant {
+            r[0] - mu
         } else {
-            -product[0] / (x0[0] + mu)
+            -product[0] / (r[0] + mu)
         };
 
         let v0_square = v0 * v0;
@@ -101,8 +101,6 @@ fn small_house<F: Float>(
 fn launch_small_house<R: Runtime, F: Float>(
     client: &ComputeClient<R::Server>,
     line_size: u8,
-    rows: u32,
-    cols: u32,
     size_tiles: u32,
     num_tiles: u32,
     col_index: u32,
@@ -114,27 +112,27 @@ fn launch_small_house<R: Runtime, F: Float>(
     beta: &TensorHandleRef<'_, R>,
 ) {
     let rows_log2 = (rows_1 as f32).log2().ceil() as u32;
-    let row_index = col_index * (rows + 1); // start of number in A_h
-    let v_rows = rows - k * size_tiles; // dimension of V matrix
+    let row_index = col_index * (r.shape[0] as u32 + 1); // start of number in A_h
+    let v_rows = r.shape[0] as u32 - k * size_tiles; // dimension of V matrix
 
     println!(
-        "rows: {rows} v_rows: {v_rows} cols: {cols} size_tiles: {size_tiles} num_tiles{num_tiles}"
+        "v_rows: {v_rows} size_tiles: {size_tiles} num_tiles: {num_tiles}"
     );
     println!(
-        "k: {k} line_index: {line_index} rows_1 {rows_1} col_index {col_index} row_index {row_index}"
+        "k: {k} line_index: {line_index} rows_1: {rows_1} col_index: {col_index} row_index: {row_index}"
     );
 
     if line_index > 0 {
-        let cube_dim = CubeDim::new_1d((PLANE_DIM_APPROX * PLANE_DIM_APPROX) as u32);
+        let cube_dim = CubeDim::new_1d(std::cmp::max(rows_1,1));
         let cube_count =
-            calculate_cube_count_elemwise((line_index / line_size as u32) as usize, cube_dim);
+            calculate_cube_count_elemwise(1, cube_dim);
         unsafe {
             cubecl_std::tensor::init::zeros_array::launch_unchecked::<F, R>(
                 client,
                 cube_count,
                 cube_dim,
                 ArrayArg::from_raw_parts::<F>(
-                    &v.handle.clone().offset_start((line_index * v_rows) as u64),
+                    &v.handle.clone(),
                     line_index as usize,
                     line_size,
                 ),
@@ -142,7 +140,7 @@ fn launch_small_house<R: Runtime, F: Float>(
         };
     }
     if rows_1 == 0 {
-        let cube_dim = CubeDim::new_1d((PLANE_DIM_APPROX * PLANE_DIM_APPROX) as u32);
+        let cube_dim = CubeDim::new_1d(1);
         let cube_count = calculate_cube_count_elemwise(1 as usize, cube_dim);
         unsafe {
             cubecl_std::tensor::init::zeros_array::launch_unchecked::<F, R>(
@@ -150,46 +148,54 @@ fn launch_small_house<R: Runtime, F: Float>(
                 cube_count,
                 cube_dim,
                 ArrayArg::from_raw_parts::<F>(
-                    &beta.handle.clone().offset_start(line_index as u64),
+                    &beta.handle.clone().offset_start((line_index * F::elem_size()) as u64),
                     1,
-                    1,
+                    line_size,
                 ),
             );
         }
-        let cube_dim = CubeDim::new_1d((PLANE_DIM_APPROX * PLANE_DIM_APPROX) as u32);
+        let cube_dim = CubeDim::new_1d(1);
         let cube_count = calculate_cube_count_elemwise(1 as usize, cube_dim);
         unsafe {
             cubecl_std::tensor::init::ones_array::launch_unchecked::<F, R>(
                 client,
                 cube_count,
                 cube_dim,
-                ArrayArg::from_raw_parts::<F>(&v.handle, 1, 1),
+                ArrayArg::from_raw_parts::<F>(&v.handle, 1, line_size),
             );
         }
     } else {
-        let cube_dim = CubeDim::new_1d((PLANE_DIM_APPROX * PLANE_DIM_APPROX) as u32);
-        let cube_count = calculate_cube_count_elemwise(rows_1 as usize, cube_dim);
+        let cube_dim = CubeDim::new_1d(rows_1);
+        let cube_count = calculate_cube_count_elemwise(1, cube_dim);
+        let v_offset = ((line_index * v_rows) + line_index) as u64;
+        let v_size = v.handle.size()  as u64; // - v_offset as u64;
+        println!("v_offset: {v_offset} v_size: {v_size}");
         unsafe {
-            small_house::launch_unchecked::<F, R>(
+            small_house::launch::<F, R>(
                 client,
                 cube_count,
                 cube_dim,
-                ArrayArg::from_raw_parts::<F>(&r.handle.clone().offset_start(rows as u64), 1, 1),
-                ArrayArg::from_raw_parts::<F>(&r.handle.clone().offset_start(rows_1 as u64), 1, 1),
-                ScalarArg::new(rows),
-                ScalarArg::new(rows_log2),
-                TensorArg::from_raw_parts::<F>(
-                    &v.handle
+                ArrayArg::from_raw_parts::<F>(
+                    &r.handle
                         .clone()
-                        .offset_start(((line_index * v_rows) + line_index) as u64),
-                    v.strides,
-                    v.shape,
+                        .offset_start((row_index * F::elem_size()) as u64),
+                    r.strides[0],
+                    1,
+                ),
+                ScalarArg::new(rows_1),
+                ScalarArg::new(rows_log2),
+                ArrayArg::from_raw_parts::<F>(
+                    &v.handle.clone().offset_start(v_offset * F::elem_size() as u64),
+                    ((v_size - v_offset) as usize * F::elem_size() as usize) as usize,
                     line_size,
                 ),
                 ArrayArg::from_raw_parts::<F>(
-                    &beta.handle.clone().offset_start(line_index as u64),
-                    1,
-                    1,
+                    &beta
+                        .handle
+                        .clone()
+                        .offset_start((F::elem_size() * line_index) as u64),
+                        1,
+                    line_size,
                 ),
                 cube_dim.num_elems(),
             );
@@ -258,8 +264,8 @@ fn launch_small_left_r_update<R: Runtime, F: Float>(
     // must use rows - col_index instead of cols - col_index
     /*dbl_small_leftRupdate<<<1,nrows-colidx>>>
     (rows,endcol,size_tiles,col_index,A_d,&V_d[L*v_rows+line_index],&beta_d[line_index]);*/
-    let cube_dim = CubeDim::new_1d((PLANE_DIM_APPROX * PLANE_DIM_APPROX) as u32);
-    let cube_count = calculate_cube_count_elemwise((rows - col_index) as usize, cube_dim);
+    let cube_dim = CubeDim::new_1d(rows-col_index);
+    let cube_count = calculate_cube_count_elemwise(1, cube_dim);
     unsafe {
         small_left_r_update::launch_unchecked::<F, R>(
             client,
@@ -272,13 +278,16 @@ fn launch_small_left_r_update<R: Runtime, F: Float>(
             TensorArg::from_raw_parts::<F>(
                 &v.handle
                     .clone()
-                    .offset_start(((line_index * v_rows) + line_index) as u64),
+                    .offset_start((((line_index * v_rows) + line_index) * F::elem_size()) as u64),
                 v.strides,
                 v.shape,
                 line_size,
             ),
             ArrayArg::from_raw_parts::<F>(
-                &beta.handle.clone().offset_start(line_index as u64),
+                &beta
+                    .handle
+                    .clone()
+                    .offset_start((line_index * F::elem_size()) as u64),
                 1,
                 1,
             ),
@@ -414,7 +423,7 @@ fn launch_medium_left_r_update<R: Runtime, F: Float>(
             TensorArg::from_raw_parts::<F>(
                 &v.handle
                     .clone()
-                    .offset_start(((line_index * v_rows) + line_index) as u64),
+                    .offset_start((((line_index * v_rows) + line_index) * F::elem_size()) as u64),
                 v.strides,
                 v.shape,
                 line_size,
@@ -431,7 +440,10 @@ fn launch_medium_left_r_update<R: Runtime, F: Float>(
             cube_dim,
             ScalarArg::new(nhouse),
             ArrayArg::from_raw_parts::<F>(
-                &beta.handle.clone().offset_start(line_index as u64),
+                &beta
+                    .handle
+                    .clone()
+                    .offset_start((line_index * F::elem_size()) as u64),
                 1,
                 1,
             ),
@@ -470,7 +482,7 @@ fn launch_medium_left_r_update<R: Runtime, F: Float>(
 fn beta_times_v<F: Float>(
     rows: u32,
     size_tiles: u32,
-    beta: &Array<F>,
+    beta: &Tensor<F>,
     v: &Tensor<F>,
     w: &mut Tensor<F>,
     #[comptime] shared_memory_size: u32,
@@ -517,7 +529,7 @@ fn initialize_wy_t<F: Float>(
 fn beta_next_w<F: Float>(
     rows: u32,
     size_tiles: u32,
-    beta: &Array<F>,
+    beta: &Tensor<F>,
     v: &Tensor<F>,
     w: &mut Tensor<F>,
     wy_t: &Tensor<F>,
@@ -620,7 +632,7 @@ fn launch_medium_vb_to_w<R: Runtime, F: Float>(
             cube_dim,
             ScalarArg::new(rowdim),
             ScalarArg::new(size_tiles),
-            beta.as_array_arg(line_size),
+            beta.as_tensor_arg(line_size),
             v.as_tensor_arg(line_size),
             w.as_tensor_arg(line_size),
             cube_dim.num_elems(),
@@ -654,15 +666,23 @@ fn launch_medium_vb_to_w<R: Runtime, F: Float>(
                 cube_dim,
                 ScalarArg::new(rowdim),
                 ScalarArg::new(size_tiles),
-                ArrayArg::from_raw_parts::<F>(&beta.handle.clone().offset_start(j as u64), 1, 1),
                 TensorArg::from_raw_parts::<F>(
-                    &v.handle.clone().offset_start((j * rowdim) as u64),
+                    &beta
+                        .handle
+                        .clone()
+                        .offset_start((j * F::elem_size()) as u64),
+                    beta.shape,
+                    beta.strides,
+                    line_size,
+                ),
+                TensorArg::from_raw_parts::<F>(
+                    &v.handle.clone().offset_start((j * rowdim * F::elem_size()) as u64),
                     v.strides,
                     v.shape,
                     line_size,
                 ),
                 TensorArg::from_raw_parts::<F>(
-                    &w.handle.clone().offset_start((j * rowdim) as u64),
+                    &w.handle.clone().offset_start((j * rowdim * F::elem_size()) as u64),
                     w.strides,
                     w.shape,
                     line_size,
@@ -1009,15 +1029,15 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {
-    let rows = q.shape[0];
-    let cols = q.shape[1];
-    let size_tiles = client.properties().hardware.plane_size_min as usize;
-    let num_tiles = cols / size_tiles;
+    let rows = r.shape[0] as u32;
+    let cols = r.shape[1] as u32;
+    let size_tiles = std::cmp::min(client.properties().hardware.plane_size_min, cols); 
+    let num_tiles = cols.div_ceil(size_tiles);
     let size_house = rows;
-    let size_pad = size_tiles as usize; // padding for nonsquare tiles
+    let size_pad = size_tiles; // padding for nonsquare tiles
     let size_v_and_w = size_house * size_tiles;
 
-    let vectorization_factor = 1;
+    let line_size = 1;
     /* tensor_line_size_parallel(
         R::supported_line_sizes().iter().cloned(),
         r.shape,
@@ -1025,21 +1045,21 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
         1,
     );*/
 
-    let cube_dim = CubeDim::default();
-    let lines_x = cols as u32 / vectorization_factor as u32;
+    /*let cube_dim = CubeDim::default();
+    let lines_x = cols as u32 / line_size as u32;
     let cube_count_x = lines_x.div_ceil(cube_dim.x);
     let cube_count_y = (rows as u32).div_ceil(cube_dim.y);
-    let _cube_count = CubeCount::new_2d(cube_count_x, cube_count_y);
+    let _cube_count = CubeCount::new_2d(cube_count_x, cube_count_y);*/
 
     let beta = TensorHandle::<R, E>::zeros(client, [size_tiles as usize].to_vec());
-    let v = TensorHandle::<R, E>::zeros(client, [rows].to_vec());
-    let w = TensorHandle::<R, E>::zeros(client, [size_v_and_w + size_pad].to_vec());
-    let rt_dot_v = TensorHandle::<R, E>::zeros(client, [size_v_and_w + size_pad].to_vec());
-    let brtv = TensorHandle::<R, E>::zeros(client, [size_house + size_pad].to_vec());
-    let wy_t = TensorHandle::<R, E>::zeros(client, [rows * rows + size_pad].to_vec());
-    let qwy_t = TensorHandle::<R, E>::zeros(client, [rows * rows + size_pad].to_vec());
-    let yw_t = TensorHandle::<R, E>::zeros(client, [rows * rows + size_pad].to_vec());
-    let yw_tc = TensorHandle::<R, E>::zeros(client, [rows * cols + size_pad].to_vec());
+    let v = TensorHandle::<R, E>::zeros(client, [r.shape[0]].to_vec());
+    let w = TensorHandle::<R, E>::zeros(client, [(size_v_and_w + size_pad) as usize].to_vec());
+    let rt_dot_v = TensorHandle::<R, E>::zeros(client, [(size_v_and_w + size_pad) as usize].to_vec());
+    let brtv = TensorHandle::<R, E>::zeros(client, [(size_house + size_pad) as usize].to_vec());
+    let wy_t = TensorHandle::<R, E>::zeros(client, [r.shape[0]* r.shape[0] + size_pad as usize].to_vec());
+    let qwy_t = TensorHandle::<R, E>::zeros(client, [r.shape[0] * r.shape[0] + size_pad as usize].to_vec());
+    let yw_t = TensorHandle::<R, E>::zeros(client, [r.shape[0] * r.shape[0] + size_pad as usize].to_vec());
+    let yw_tc = TensorHandle::<R, E>::zeros(client, [r.shape.iter().product::<usize>() + size_pad as usize].to_vec());
 
     // k runs over the number of blocks
     for k in 0..num_tiles {
@@ -1047,87 +1067,89 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
         // line runs over the columns in one block
         for line_index in 0..size_tiles {
             let col_index = k * size_tiles + line_index; // index of the current column
-            let rows_1 = rows - col_index as usize - 1; // #rows in Householder vector - 1
+            let rows_1 = rows - col_index - 1; // #rows in Householder vector - 1
             launch_small_house::<R, E>(
                 client,
-                vectorization_factor,
-                rows as u32,
-                cols as u32,
-                size_tiles as u32,
-                num_tiles as u32,
-                col_index as u32,
-                rows_1 as u32,
-                k as u32,
-                line_index as u32,
+                line_size,
+                size_tiles,
+                num_tiles,
+                col_index,
+                rows_1,
+                k,
+                line_index,
                 r,
                 &v.as_ref(),
                 &beta.as_ref(),
             );
+            println!("Finished small house");
             let actual = client.read_one(beta.handle.clone());
             let beta_host = E::from_bytes(&actual);
             if beta_host[col_index as usize] == E::from_int(0) {
                 println!("Zero beta detected.");
             } else {
-                if rows - col_index as usize <= size_tiles as usize {
+                if rows - col_index <= size_tiles {
                     launch_small_left_r_update::<R, E>(
                         client,
-                        vectorization_factor,
-                        rows as u32,
-                        size_tiles as u32,
-                        col_index as u32,
-                        k as u32,
-                        line_index as u32,
+                        line_size,
+                        rows,
+                        size_tiles,
+                        col_index,
+                        k,
+                        line_index,
                         r,
                         &v.as_ref(),
                         &beta.as_ref(),
                     );
+                    println!("Finished small left r update");
                 } else {
                     launch_medium_left_r_update::<R, E>(
                         client,
-                        vectorization_factor,
-                        rows as u32,
-                        size_tiles as u32,
-                        col_index as u32,
-                        k as u32,
-                        line_index as u32,
+                        line_size,
+                        rows,
+                        size_tiles,
+                        col_index,
+                        k,
+                        line_index,
                         r,
                         &v.as_ref(),
                         &beta.as_ref(),
                         &rt_dot_v.as_ref(),
                         &brtv.as_ref(),
                     );
+                    println!("Finished medium left r update");
                 }
             }
         }
 
         launch_medium_vb_to_w::<R, E>(
             client,
-            vectorization_factor,
-            rows as u32,
-            size_tiles as u32,
-            k as u32,
+            line_size,
+            rows,
+            size_tiles,
+            k,
             &v.as_ref(),
             &w.as_ref(),
             &wy_t.as_ref(),
             &beta.as_ref(),
         );
+        println!("Finished medium vb to w");
         // update Q, WYT matrix has rows - k*size_tiles instead of rows
         launch_small_qwy_t::<R, E>(
             client,
-            vectorization_factor,
-            rows as u32,
-            size_tiles as u32,
-            k as u32,
+            line_size,
+            rows,
+            size_tiles,
+            k,
             q,
             &wy_t.as_ref(),
             &qwy_t.as_ref(),
         );
         launch_small_q_update::<R, E>(
             client,
-            vectorization_factor,
-            rows as u32,
-            size_tiles as u32,
-            k as u32,
+            line_size,
+            rows,
+            size_tiles,
+            k,
             q,
             &qwy_t.as_ref(),
         );
@@ -1135,32 +1157,32 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
             // update R
             launch_small_yw_t::<R, E>(
                 client,
-                vectorization_factor,
-                rows as u32,
-                size_tiles as u32,
-                k as u32,
+                line_size,
+                rows,
+                size_tiles,
+                k,
                 &v.as_ref(),
                 &w.as_ref(),
                 &yw_t.as_ref(),
             );
             launch_small_yw_tc::<R, E>(
                 client,
-                vectorization_factor,
-                rows as u32,
-                cols as u32,
-                size_tiles as u32,
-                k as u32,
+                line_size,
+                rows,
+                cols,
+                size_tiles,
+                k,
                 &yw_t.as_ref(),
                 r,
                 &yw_tc.as_ref(),
             );
             launch_small_r_add_yw_tc::<R, E>(
                 client,
-                vectorization_factor,
-                rows as u32,
-                cols as u32,
-                size_tiles as u32,
-                k as u32,
+                line_size,
+                rows,
+                cols, 
+                size_tiles,
+                k,
                 r,
                 &yw_tc.as_ref(),
             );

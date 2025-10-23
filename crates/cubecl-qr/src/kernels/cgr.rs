@@ -19,14 +19,14 @@ fn hypot<F: Float>(a: F, b: F) -> F {
     // F::sqrt(a*a+b*b)
 }
 
-#[cube(launch_unchecked)]
+#[cube(launch, launch_unchecked)]
 fn get_column_from_matrix<F: Float>(col_index: u32, r: &Tensor<F>, l: &mut Tensor<F>) {
     if ABSOLUTE_POS < l.len() {
         l[ABSOLUTE_POS] = r[ABSOLUTE_POS + col_index * l.len()]
     }
 }
 
-#[cube(launch_unchecked)]
+#[cube(launch, launch_unchecked)]
 pub fn givens_rotation_by_column<F: Float>(
     col_index: u32,
     l: &Tensor<F>,
@@ -75,15 +75,17 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
 ) {
-    let vectorization_factor = 1;
+    let line_size = 1;
 
     let cube_dim = CubeDim::default();
 
-    let cube_count =
-        calculate_cube_count_elemwise(r.shape[1] / vectorization_factor as usize, cube_dim);
+    let cube_count = calculate_cube_count_elemwise(r.shape[1] / line_size as usize, cube_dim);
 
     let l = TensorHandle::<R, E>::empty(client, [r.shape[1]].to_vec());
 
+    println!("l: {l:?}");
+    println!("q: {q:?}");
+    println!("r: {r:?}");
     for i in 0..r.shape[1] - 1 {
         unsafe {
             get_column_from_matrix::launch_unchecked::<E, R>(
@@ -91,19 +93,20 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
                 cube_count.clone(),
                 cube_dim,
                 ScalarArg::new(i as u32),
-                r.as_tensor_arg(vectorization_factor),
-                l.as_ref().as_tensor_arg(vectorization_factor),
+                r.as_tensor_arg(line_size),
+                l.as_ref().as_tensor_arg(line_size),
             );
             givens_rotation_by_column::launch_unchecked::<E, R>(
                 client,
                 cube_count.clone(),
                 cube_dim,
                 ScalarArg::new(i as u32),
-                l.as_ref().as_tensor_arg(vectorization_factor),
-                q.as_tensor_arg(vectorization_factor),
-                r.as_tensor_arg(vectorization_factor),
+                l.as_ref().as_tensor_arg(line_size),
+                q.as_tensor_arg(line_size),
+                r.as_tensor_arg(line_size),
             );
             let bytes = client.read_one(q.handle.clone());
+            //let bytes = client.read_one_tensor(q.handle.copy_descriptor(shape, strides, elem_size))
             let output = E::from_bytes(&bytes);
             println!("Q iter {i} => {output:?}");
         }
