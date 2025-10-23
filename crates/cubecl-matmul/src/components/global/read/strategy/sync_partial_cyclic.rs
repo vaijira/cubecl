@@ -1,11 +1,11 @@
 use std::marker::PhantomData;
 
-use crate::components::global::memory::GlobalIterator;
 use crate::components::global::multi_stage::LoadMaxRoundPlaneCount;
 use crate::components::global::read::{SyncPartialLoadingStrategy, tiled::TiledLayout};
 use crate::components::global::{GlobalConfig, RoleRule};
 use crate::components::stage::{ContiguousTilingLayout, StridedStage, TilingOrder};
 use crate::components::{InvalidConfigError, MatmulIdent, MatrixPrecision, TilingScheme};
+use crate::components::{global::memory::GlobalIterator, stage::TilingValidation};
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
@@ -43,6 +43,8 @@ impl<TO: TilingOrder> LoadingValidation for SyncPartialCyclicLoading<TO> {
                 ));
             }
         }
+
+        ContiguousTilingLayout::<TO>::check(config.global_memory_config(ident))?;
 
         Ok(())
     }
@@ -168,14 +170,14 @@ pub(crate) fn load_and_store_line<IP: MatrixPrecision, TO: TilingOrder, G: Globa
     let layout = TiledLayout::new(comptime!(config.global_memory_config(job.ident)));
     let view = global_iter.view().view(layout);
 
-    let (line_size, tile_size, tile_count_row, tile_count_col) = comptime! {
+    let (tile_size, tile_count_row, tile_count_col) = comptime! {
         (
-            view.line_size(),
             config.tiling_scheme().elements_in_tile(job.ident),
             config.tiling_scheme().tiles_in_stage_row(job.ident),
             config.tiling_scheme().tiles_in_stage_col(job.ident),
         )
     };
+    let line_size = view.line_size();
 
     let tile_index = unit_position / tile_size;
     let pos_within_tile = unit_position % tile_size;

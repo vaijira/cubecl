@@ -15,9 +15,7 @@ use core::any::TypeId;
 use cubecl_core::{Runtime, client::ComputeClient, frontend::TensorHandleRef};
 use cubecl_core::{prelude::*, try_tensor_line_size_parallel};
 use cubecl_runtime::TypeUsage;
-use cubecl_std::tensor::{
-    MatrixBatchLayout, TensorHandle, into_contiguous_pitched, matrix_batch_layout,
-};
+use cubecl_std::tensor::{MatrixBatchLayout, TensorHandle, matrix_batch_layout};
 
 use super::Algorithm;
 
@@ -101,23 +99,13 @@ pub fn launch_ref<R: Runtime, MP: MatmulPrecision, A: Algorithm>(
     let lhs_owned;
     let rhs_owned;
     let lhs = if lhs_make_contiguous {
-        lhs_owned = match lhs {
-            MatmulInputHandleRef::Normal(data) => {
-                MatmulInputHandle::Normal(into_contiguous_pitched::<R, LhsG<MP>>(client, data))
-            }
-            MatmulInputHandleRef::Quantized { .. } => unimplemented!(),
-        };
+        lhs_owned = lhs.into_contiguous::<LhsG<MP>>(client);
         &lhs_owned.as_ref()
     } else {
         lhs
     };
     let rhs = if rhs_make_contiguous {
-        rhs_owned = match rhs {
-            MatmulInputHandleRef::Normal(data) => {
-                MatmulInputHandle::Normal(into_contiguous_pitched::<R, RhsG<MP>>(client, data))
-            }
-            MatmulInputHandleRef::Quantized { .. } => unimplemented!(),
-        };
+        rhs_owned = rhs.into_contiguous::<RhsG<MP>>(client);
         &rhs_owned.as_ref()
     } else {
         rhs
@@ -191,13 +179,23 @@ fn launch_inner_ref<R: Runtime, MP: MatmulPrecision, A: Algorithm>(
     let lhs = lhs_handle.data();
     let rhs = rhs_handle.data();
 
-    let line_sizes = AvailableLineSizes::from_types::<R>(&lhs_elem, &rhs_elem, &acc_elem);
+    let line_sizes =
+        AvailableLineSizes::from_type_sizes::<R>(lhs.elem_size, rhs.elem_size, out.elem_size);
     let line_sizes = A::filter_line_sizes(line_sizes);
-    let line_sizes = line_sizes
+    let mut line_sizes = line_sizes
         .filter_lhs_with_tensor(lhs.strides, lhs.shape, problem.lhs_layout)
         .filter_rhs_with_tensor(rhs.strides, rhs.shape, problem.rhs_layout)
         .filter_out_with_tensor(out.strides, out.shape)
         .pick_max()?;
+
+    // The large line size resulting from dequantizing ends up slower due to restrictions on
+    // algorithms. Use this as a quick and dirty fix.
+    if lhs_handle.scale().is_some() {
+        line_sizes.lhs = 1;
+    }
+    if rhs_handle.scale().is_some() {
+        line_sizes.rhs = 1;
+    }
 
     let fix_plane_dim = |plane_dim: u32| {
         // Sometimes the GPU doesn't support plane instructions and doesn't report the
@@ -284,7 +282,6 @@ pub fn matmul_cmma_tma_ref_no_check<R: Runtime, MP: MatmulPrecision, A: Algorith
     let rhs = rhs_handle.data();
 
     let rank = lhs.strides.len();
-    let out_elem = AccG::<MP>::as_type_native().expect("To be a native type");
 
     let m = lhs.shape[rank - 2] as u32;
     let k = lhs.shape[rank - 1] as u32;
@@ -303,7 +300,7 @@ pub fn matmul_cmma_tma_ref_no_check<R: Runtime, MP: MatmulPrecision, A: Algorith
         lhs: 1,
         rhs: 1,
         out: try_tensor_line_size_parallel(
-            R::io_optimized_line_sizes_unchecked(&out_elem),
+            R::io_optimized_line_sizes_unchecked(out.elem_size),
             out.shape,
             out.strides,
             rank - 1,

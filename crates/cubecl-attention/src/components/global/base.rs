@@ -1,14 +1,14 @@
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 
-use crate::components::global::dummy::AttentionReader;
+use crate::components::global::simple::AttentionReader;
 use cubecl_matmul::components::{global::memory::GlobalMemoryConfig, stage::StageMemoryConfig};
 use cubecl_std::{CubeOption, tensor::r#virtual::VirtualTensor};
 
 use crate::components::{
     AttentionIdent, AttentionLineSizes, AttentionPrecision, AttentionProblem, AttentionSelection,
     AttentionSetupError, AttentionTilingScheme, AvailableLineSizes, attention_types::*,
-    global::dummy::QueryReader, stage::StageAttentionConfig,
+    global::simple::QueryReader, stage::StageAttentionConfig,
 };
 use std::{fmt::Debug, hash::Hash};
 
@@ -83,6 +83,7 @@ pub trait GlobalAttention<AP: AttentionPrecision>: 'static + Send + Sync {
     fn init_mask_reader(
         q_offset: u32,
         mask: CubeOption<VirtualTensor<MSK<AP>>>,
+        seq_kv_shape: u32,
         #[comptime] config: Self::Config,
     ) -> Self::MaskReader;
 
