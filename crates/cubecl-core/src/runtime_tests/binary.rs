@@ -184,6 +184,64 @@ test_binary_impl!(
     ]
 );
 
+test_binary_impl!(
+    test_hypot,
+    F,
+    F::hypot,
+    [
+        {
+            input_vectorization: 1,
+            out_vectorization: 1,
+            lhs: as_type![F: 3., 0., 5., 8.],
+            rhs: as_type![F: 4., 5., 0., 15.],
+            expected: as_type![F: 5., 5., 5., 17.]
+        },
+        {
+            input_vectorization: 2,
+            out_vectorization: 2,
+            lhs: as_type![F: 3., 0., 5., 8.],
+            rhs: as_type![F: 4., 5., 0., 15.],
+            expected: as_type![F: 5., 5., 5., 17.]
+        },
+        {
+            input_vectorization: 4,
+            out_vectorization: 4,
+            lhs: as_type![F: -3., 0., -5., -8.],
+            rhs: as_type![F: -4., -5., 0., 15.],
+            expected: as_type![F: 5., 5., 5., 17.]
+        }
+    ]
+);
+
+test_binary_impl!(
+    test_rhypot,
+    F,
+    F::rhypot,
+    [
+        {
+            input_vectorization: 1,
+            out_vectorization: 1,
+            lhs: as_type![F: 3., 0., 5., 0.3],
+            rhs: as_type![F: 4., 5., 0., 0.4],
+            expected: as_type![F: 0.2, 0.2, 0.2, 2.]
+        },
+        {
+            input_vectorization: 2,
+            out_vectorization: 2,
+            lhs: as_type![F: 3., 0., 5., 0.3],
+            rhs: as_type![F: 4., 5., 0., 0.4],
+            expected: as_type![F: 0.2, 0.2, 0.2, 2.]
+        },
+        {
+            input_vectorization: 4,
+            out_vectorization: 4,
+            lhs: as_type![F: 0., 0., -5., -0.3],
+            rhs: as_type![F: -1., -5., 0., -0.4],
+            expected: as_type![F: 1., 0.2, 0.2, 2.]
+        }
+    ]
+);
+
 #[cube(launch_unchecked)]
 fn test_powi_kernel<F: Float>(
     lhs: &Array<Line<F>>,
@@ -354,6 +412,8 @@ macro_rules! testgen_binary {
 
             add_test!(test_dot);
             add_test!(test_powf);
+            add_test!(test_hypot);
+            add_test!(test_rhypot);
             add_test!(test_powi);
             add_test!(test_atan2);
         }
