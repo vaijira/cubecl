@@ -3,7 +3,7 @@ use tracel_llvm::mlir_rs::{
     dialect::{
         arith::{self},
         llvm,
-        ods::{llvm as llvm_ods, vector},
+        ods::{llvm as llvm_ods, math as math_ods, vector},
     },
     ir::Attribute,
 };
@@ -26,6 +26,70 @@ impl<'a> Visitor<'a> {
                     arith::addf(lhs, rhs, self.location)
                 };
                 let result = self.append_operation_with_result(operation);
+                self.insert_variable(out, result);
+            }
+            Arithmetic::ArcCos(acos) => {
+                let value = self.get_variable(acos.input);
+                let result = self.append_operation_with_result(math_ods::acos(
+                    self.context,
+                    value,
+                    self.location,
+                ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::ArcSin(asin) => {
+                let value = self.get_variable(asin.input);
+                let result = self.append_operation_with_result(math_ods::asin(
+                    self.context,
+                    value,
+                    self.location,
+                ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::ArcTan(atan) => {
+                let value = self.get_variable(atan.input);
+                let result = self.append_operation_with_result(math_ods::atan(
+                    self.context,
+                    value,
+                    self.location,
+                ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::ArcSinh(asinh) => {
+                let value = self.get_variable(asinh.input);
+                let result = self.append_operation_with_result(math_ods::asinh(
+                    self.context,
+                    value,
+                    self.location,
+                ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::ArcCosh(acosh) => {
+                let value = self.get_variable(acosh.input);
+                let result = self.append_operation_with_result(math_ods::acosh(
+                    self.context,
+                    value,
+                    self.location,
+                ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::ArcTanh(atanh) => {
+                let value = self.get_variable(atanh.input);
+                let result = self.append_operation_with_result(math_ods::atanh(
+                    self.context,
+                    value,
+                    self.location,
+                ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::ArcTan2(atan2) => {
+                let (lhs, rhs) = self.get_binary_op_variable(atan2.lhs, atan2.rhs);
+                let result = self.append_operation_with_result(math_ods::atan_2(
+                    self.context,
+                    lhs,
+                    rhs,
+                    self.location,
+                ));
                 self.insert_variable(out, result);
             }
             Arithmetic::SaturatingAdd(_) => {
@@ -104,6 +168,23 @@ impl<'a> Visitor<'a> {
                     value,
                     self.location,
                 ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::Cosh(cosh) => {
+                let value = self.get_variable(cosh.input);
+                let result = self.append_operation_with_result(llvm_ods::intr_cosh(
+                    self.context,
+                    value,
+                    self.location,
+                ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::Degrees(degrees) => {
+                let value = self.get_variable(degrees.input);
+                // 180 / pi
+                let f = self.create_float_constant_from_item(degrees.input.ty, 57.29577951308232);
+                let result =
+                    self.append_operation_with_result(arith::mulf(value, f, self.location));
                 self.insert_variable(out, result);
             }
             Arithmetic::Div(div) => {
@@ -356,6 +437,94 @@ impl<'a> Visitor<'a> {
                 ));
                 self.insert_variable(out, result);
             }
+            Arithmetic::Radians(radians) => {
+                let value = self.get_variable(radians.input);
+                // pi / 180
+                let f =
+                    self.create_float_constant_from_item(radians.input.ty, 0.017453292519943295);
+                let result =
+                    self.append_operation_with_result(arith::mulf(value, f, self.location));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::Hypot(hypot) => {
+                let (a, b) = self.get_binary_op_variable(hypot.lhs, hypot.rhs);
+                let abs_a = self.get_absolute_val(hypot.lhs.ty, a);
+                let abs_b = self.get_absolute_val(hypot.rhs.ty, b);
+                let zero = self.create_float_constant_from_item(hypot.lhs.ty, 0.0);
+                let one = self.create_float_constant_from_item(hypot.lhs.ty, 1.0);
+                let max =
+                    self.append_operation_with_result(arith::maxnumf(abs_a, abs_b, self.location));
+                let is_max_zero = self.append_operation_with_result(arith::cmpf(
+                    self.context,
+                    arith::CmpfPredicate::Oeq,
+                    max,
+                    zero,
+                    self.location,
+                ));
+                let max_safe = self.append_operation_with_result(arith::select(
+                    is_max_zero,
+                    one,
+                    max,
+                    self.location,
+                ));
+                let min =
+                    self.append_operation_with_result(arith::minimumf(abs_a, abs_b, self.location));
+                let t =
+                    self.append_operation_with_result(arith::divf(min, max_safe, self.location));
+                let t_square = self.append_operation_with_result(arith::mulf(t, t, self.location));
+                let t_square_plus_one =
+                    self.append_operation_with_result(arith::addf(t_square, one, self.location));
+                let square_root = self.append_operation_with_result(llvm_ods::intr_sqrt(
+                    self.context,
+                    t_square_plus_one,
+                    self.location,
+                ));
+                let result =
+                    self.append_operation_with_result(arith::mulf(max, square_root, self.location));
+
+                self.insert_variable(out, result);
+            }
+            Arithmetic::Rhypot(hypot) => {
+                let (a, b) = self.get_binary_op_variable(hypot.lhs, hypot.rhs);
+                let abs_a = self.get_absolute_val(hypot.lhs.ty, a);
+                let abs_b = self.get_absolute_val(hypot.rhs.ty, b);
+                let zero = self.create_float_constant_from_item(hypot.lhs.ty, 0.0);
+                let one = self.create_float_constant_from_item(hypot.lhs.ty, 1.0);
+                let max =
+                    self.append_operation_with_result(arith::maxnumf(abs_a, abs_b, self.location));
+                let is_max_zero = self.append_operation_with_result(arith::cmpf(
+                    self.context,
+                    arith::CmpfPredicate::Oeq,
+                    max,
+                    zero,
+                    self.location,
+                ));
+                let max_safe = self.append_operation_with_result(arith::select(
+                    is_max_zero,
+                    one,
+                    max,
+                    self.location,
+                ));
+                let min =
+                    self.append_operation_with_result(arith::minimumf(abs_a, abs_b, self.location));
+                let t =
+                    self.append_operation_with_result(arith::divf(min, max_safe, self.location));
+                let t_square = self.append_operation_with_result(arith::mulf(t, t, self.location));
+                let t_square_plus_one =
+                    self.append_operation_with_result(arith::addf(t_square, one, self.location));
+                let inverse_square_root = self.append_operation_with_result(math_ods::rsqrt(
+                    self.context,
+                    t_square_plus_one,
+                    self.location,
+                ));
+                let result = self.append_operation_with_result(arith::divf(
+                    inverse_square_root,
+                    max,
+                    self.location,
+                ));
+
+                self.insert_variable(out, result);
+            }
             Arithmetic::Recip(recip) => {
                 let value = self.get_variable(recip.input);
                 let one = self.create_float_constant_from_item(recip.input.ty, 1.0);
@@ -407,6 +576,24 @@ impl<'a> Visitor<'a> {
                 ));
                 self.insert_variable(out, output);
             }
+            Arithmetic::Sinh(sinh) => {
+                let value = self.get_variable(sinh.input);
+                let result = self.append_operation_with_result(llvm_ods::intr_sinh(
+                    self.context,
+                    value,
+                    self.location,
+                ));
+                self.insert_variable(out, result);
+            }
+            Arithmetic::InverseSqrt(rsqrt) => {
+                let input = self.get_variable(rsqrt.input);
+                let output = self.append_operation_with_result(math_ods::rsqrt(
+                    self.context,
+                    input,
+                    self.location,
+                ));
+                self.insert_variable(out, output);
+            }
             Arithmetic::Sqrt(sqrt) => {
                 let input = self.get_variable(sqrt.input);
                 let output = self.append_operation_with_result(llvm_ods::intr_sqrt(
@@ -424,6 +611,15 @@ impl<'a> Visitor<'a> {
                     arith::subf(lhs, rhs, self.location)
                 };
                 let result = self.append_operation_with_result(operation);
+                self.insert_variable(out, result);
+            }
+            Arithmetic::Tan(tan) => {
+                let value = self.get_variable(tan.input);
+                let result = self.append_operation_with_result(math_ods::tan(
+                    self.context,
+                    value,
+                    self.location,
+                ));
                 self.insert_variable(out, result);
             }
             Arithmetic::SaturatingSub(_) => {

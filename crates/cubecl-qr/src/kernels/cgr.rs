@@ -7,18 +7,6 @@ use cubecl_std::tensor::TensorHandle;
 // Followed algorithm described in page 2 and 3 in
 // https://thesai.org/Downloads/Volume11No5/Paper_78-Parallel_QR_Factorization_using_Givens_Rotations.pdf
 
-// Returns the hypotenuse.
-// Equivalent but more numeracally stable than F::sqrt(a*a+b*b)
-#[cube]
-fn hypot<F: Float>(a: F, b: F) -> F {
-    let a_abs = F::abs(a);
-    let b_abs = F::abs(b);
-    let max = F::max(a_abs, b_abs);
-    let min = F::min(a_abs, b_abs);
-    let r = min / max;
-    max * F::sqrt(F::from_int(1) + (r * r))
-}
-
 // Fill vector l with the col_index from matrix r.
 #[cube(launch, launch_unchecked)]
 fn get_column_from_matrix<F: Float>(col_index: u32, r: &Tensor<F>, l: &mut Tensor<F>) {
@@ -41,7 +29,7 @@ fn givens_rotation_by_column<F: Float>(
         let mut mu_prime_i = l[j];
         while j > col_index {
             let a = mu_prime_i;
-            mu_prime_i = hypot::<F>(a, l[j - 1]);
+            mu_prime_i = F::hypot(a, l[j - 1]);
             let c = l[j - 1] / mu_prime_i;
             let s = a / mu_prime_i;
 
@@ -65,18 +53,20 @@ fn givens_rotation_by_column<F: Float>(
 
 /// Launch QR decomposition common Givens rotation kernels by ref
 pub fn launch_ref<R: Runtime, E: Float + CubeElement>(
-    client: &ComputeClient<R::Server>,
+    client: &ComputeClient<R>,
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
+    dtype: StorageType,
 ) {
-    launch::<R, E>(client, q, r);
+    launch::<R, E>(client, q, r, dtype);
 }
 
 /// Launch QR decomposition common Givens rotation kernels.
 pub fn launch<R: Runtime, E: Float + CubeElement>(
-    client: &ComputeClient<R::Server>,
+    client: &ComputeClient<R>,
     q: &TensorHandleRef<'_, R>,
     r: &TensorHandleRef<'_, R>,
+    dtype: StorageType,
 ) {
     let line_size = 1;
 
@@ -84,11 +74,11 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
 
     let cube_count = calculate_cube_count_elemwise(r.shape[1] / line_size as usize, cube_dim);
 
-    let l = TensorHandle::<R, E>::empty(client, [r.shape[1]].to_vec());
+    let l = TensorHandle::<R>::empty(client, [r.shape[1]].to_vec(), dtype);
 
     for i in 0..r.shape[1] - 1 {
         unsafe {
-            get_column_from_matrix::launch_unchecked::<E, R>(
+            let _ = get_column_from_matrix::launch_unchecked::<E, R>(
                 client,
                 cube_count.clone(),
                 cube_dim,
@@ -96,7 +86,7 @@ pub fn launch<R: Runtime, E: Float + CubeElement>(
                 r.as_tensor_arg(line_size),
                 l.as_ref().as_tensor_arg(line_size),
             );
-            givens_rotation_by_column::launch_unchecked::<E, R>(
+            let _ = givens_rotation_by_column::launch_unchecked::<E, R>(
                 client,
                 cube_count.clone(),
                 cube_dim,

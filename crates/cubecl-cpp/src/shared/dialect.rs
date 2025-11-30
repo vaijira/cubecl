@@ -633,6 +633,32 @@ pub trait DialectInstructions<D: Dialect> {
         }
     }
 
+    fn compile_instruction_hypot(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: &str,
+        rhs: &str,
+        elem: Elem<D>,
+    ) -> std::fmt::Result {
+        match elem {
+            Elem::F32 => write!(f, "hypotf({lhs}, {rhs})"),
+            Elem::F64 => write!(f, "hypot({lhs}, {rhs})"),
+            _ => panic!("Unsupported type for hypot"),
+        }
+    }
+
+    fn compile_instruction_rhypot(
+        f: &mut std::fmt::Formatter<'_>,
+        lhs: &str,
+        rhs: &str,
+        elem: Elem<D>,
+    ) -> std::fmt::Result {
+        match elem {
+            Elem::F32 => write!(f, "rhypotf({lhs}, {rhs})"),
+            Elem::F64 => write!(f, "rhypot({lhs}, {rhs})"),
+            _ => panic!("Unsupported type for hypot"),
+        }
+    }
+
     fn compile_instruction_half_function_name_prefix() -> &'static str {
         "h"
     }
@@ -676,14 +702,24 @@ pub trait DialectInstructions<D: Dialect> {
         input: &Variable<D>,
         out_elem: &Elem<D>,
     ) -> std::fmt::Result;
+    fn compile_warp_elect(f: &mut std::fmt::Formatter<'_>, out: &str) -> std::fmt::Result {
+        write!(
+            f,
+            "
+unsigned int mask = __activemask();
+unsigned int leader = __ffs(mask) - 1;
+{out} = threadIdx.x % warpSize == leader;
+            "
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, new)]
 pub struct ManualMma<'a, D: Dialect> {
     pub shape: MmaShape<D>,
-    pub frag_a: &'a [Variable<D>],
-    pub frag_b: &'a [Variable<D>],
-    pub frag_c: &'a [Variable<D>],
+    pub frag_a: &'a Variable<D>,
+    pub frag_b: &'a Variable<D>,
+    pub frag_c: &'a Variable<D>,
     pub frag_d: &'a Variable<D>,
 }
 

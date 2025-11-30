@@ -2,8 +2,11 @@ use std::fmt::Debug;
 use std::sync::atomic::Ordering;
 use std::{collections::HashMap, sync::mpsc};
 
-use cubecl_core::{ExecutionMode, compute::CubeTask, prelude::CompiledKernel, server::Bindings};
-use cubecl_runtime::{id::KernelId, memory_management::MemoryManagement, storage::BytesStorage};
+use cubecl_core::{ExecutionMode, prelude::CompiledKernel, server::Bindings};
+use cubecl_runtime::compiler::CompilationError;
+use cubecl_runtime::{
+    compiler::CubeTask, id::KernelId, memory_management::MemoryManagement, storage::BytesStorage,
+};
 
 use crate::{
     CpuCompiler,
@@ -49,24 +52,33 @@ impl Scheduler {
         bindings: Bindings,
         kind: ExecutionMode,
         memory_management: &mut MemoryManagement<BytesStorage>,
-    ) {
-        let kernel = self
-            .compilation_cache
-            .entry(kernel.id())
-            .or_insert_with(|| {
-                kernel.compile(
-                    &mut Default::default(),
-                    &MlirCompilerOptions::default(),
-                    kind,
-                )
-            });
+        memory_management_shared_memory: &mut MemoryManagement<BytesStorage>,
+    ) -> Result<(), CompilationError> {
+        let kernel_id = kernel.id();
+        let kernel = if let Some(kernel) = self.compilation_cache.get_mut(&kernel_id) {
+            kernel
+        } else {
+            let kernel = kernel.compile(
+                &mut Default::default(),
+                &MlirCompilerOptions::default(),
+                kind,
+            )?;
+            self.compilation_cache.insert(kernel_id.clone(), kernel);
+            self.compilation_cache
+                .get_mut(&kernel_id)
+                .expect("Just inserted")
+        };
 
         let cube_dim = kernel.cube_dim;
         let cube_dim_size = cube_dim.num_elems();
 
         let mlir_engine = kernel.repr.clone().unwrap();
-        let mut mlir_data =
-            MlirData::new(bindings, &mlir_engine.0.shared_memories, memory_management);
+        let mut mlir_data = MlirData::new(
+            bindings,
+            &mlir_engine.0.shared_memories,
+            memory_management,
+            memory_management_shared_memory,
+        );
         mlir_data.builtin.set_cube_dim(cube_dim);
         mlir_data.builtin.set_cube_count(cube_count);
 
@@ -110,5 +122,7 @@ impl Scheduler {
                 break;
             }
         }
+
+        Ok(())
     }
 }

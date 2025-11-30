@@ -4,6 +4,7 @@ use cubecl_core::{CubeElement, Runtime, prelude::Float};
 
 use crate::{
     MatmulInputHandle,
+    components::MatmulElems,
     kernels::naive,
     tests::{
         naive::utils::MatmulTestCase,
@@ -17,6 +18,17 @@ pub fn test_small<R: Runtime, F: Float + CubeElement + Display + Sample>(device:
         m: 64,
         k: 64,
         n: 64,
+        batch: 1,
+    };
+
+    test_simple::<R, F>(case, device);
+}
+
+pub fn test_odd<R: Runtime, F: Float + CubeElement + Display + Sample>(device: &R::Device) {
+    let case = MatmulTestCase {
+        m: 1,
+        k: 101,
+        n: 255,
         batch: 1,
     };
 
@@ -70,12 +82,24 @@ fn test_simple<R: Runtime, F: Float + CubeElement + Display + Sample>(
 
     let expected = case.matmul_cpu::<R, F>(&lhs, &rhs, &client);
 
-    let out: TensorHandle<R, F> = case.empty_out(&client);
-    naive::launch::<R, F, F>(
+    let out: TensorHandle<R> = case.empty_out::<R, F>(&client);
+    let dtypes = MatmulElems {
+        lhs_global: F::as_type_native_unchecked(),
+        rhs_global: F::as_type_native_unchecked(),
+        acc_global: F::as_type_native_unchecked(),
+        lhs_stage: F::as_type_native_unchecked(),
+        rhs_stage: F::as_type_native_unchecked(),
+        acc_stage: F::as_type_native_unchecked(),
+        lhs_register: F::as_type_native_unchecked(),
+        rhs_register: F::as_type_native_unchecked(),
+        acc_register: F::as_type_native_unchecked(),
+    };
+    naive::launch(
         &client,
         MatmulInputHandle::Normal(lhs),
         MatmulInputHandle::Normal(rhs),
         &out.as_ref(),
+        dtypes,
     )
     .unwrap();
 

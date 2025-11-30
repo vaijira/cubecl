@@ -5,18 +5,21 @@ use crate::{
         storage::gpu::GpuResource, stream::CudaStreamBackend, sync::Fence, valid_strides,
     },
 };
-use cubecl_common::{bytes::Bytes, stream_id::StreamId};
+use cubecl_common::{
+    bytes::{AllocationProperty, Bytes},
+    stream_id::StreamId,
+};
 use cubecl_core::{
     ExecutionMode, MemoryUsage,
-    compute::CubeTask,
     future::DynFut,
-    server::{Binding, CopyDescriptor, Handle, IoError, ProfileError},
+    server::{Binding, CopyDescriptor, ExecutionError, Handle, IoError, ProfileError},
 };
 use cubecl_runtime::{
+    compiler::{CompilationError, CubeTask},
     id::KernelId,
     logging::ServerLogger,
     memory_management::{MemoryAllocationMode, MemoryHandle},
-    stream::ResolvedStreams,
+    stream::{GcTask, ResolvedStreams},
 };
 use cudarc::driver::sys::{
     CUDA_MEMCPY2D_st, CUmemorytype, CUstream_st, CUtensorMap, cuMemcpy2DAsync_v2,
@@ -167,9 +170,12 @@ impl<'a> Command<'a> {
         let fence = Fence::new(self.streams.current().sys);
 
         async move {
-            fence.wait_sync();
+            let sync = fence.wait_sync();
             // Release memory handle.
             core::mem::drop(descriptors_moved);
+
+            sync?;
+
             result
         }
     }
@@ -296,7 +302,7 @@ impl<'a> Command<'a> {
     ///
     /// * `Ok(())` - If the write operation succeeds.
     /// * `Err(IoError)` - If the strides are invalid or the resource cannot be accessed.
-    pub fn write_to_gpu(&mut self, descriptor: CopyDescriptor, data: &[u8]) -> Result<(), IoError> {
+    pub fn write_to_gpu(&mut self, descriptor: CopyDescriptor, data: Bytes) -> Result<(), IoError> {
         let CopyDescriptor {
             binding,
             shape,
@@ -308,9 +314,25 @@ impl<'a> Command<'a> {
         }
 
         let resource = self.resource(binding)?;
+
+        let size = data.len();
+        let data = match data.property() {
+            AllocationProperty::File => {
+                let mut buffer = self.reserve_pinned(size, None).unwrap();
+                data.copy_into(&mut buffer);
+                buffer
+            }
+            _ => data,
+        };
         let current = self.streams.current();
 
-        unsafe { write_to_gpu(shape, strides, elem_size, data, resource.ptr, current.sys) }
+        unsafe { write_to_gpu(shape, strides, elem_size, &data, resource.ptr, current.sys) }?;
+
+        // Make sure we don't reuse the pinned memory until the write to gpu is completed.
+        let event = Fence::new(current.sys);
+        self.streams.gc(GcTask::new(data, event));
+
+        Ok(())
     }
 
     /// Allocates a new GPU memory buffer and immediately copies contiguous host data into it.
@@ -325,11 +347,26 @@ impl<'a> Command<'a> {
     /// * `Err(IoError)` - If the allocation or data copy fails.
     pub fn create_with_data(&mut self, data: &[u8]) -> Result<Handle, IoError> {
         let handle = self.reserve(data.len() as u64)?;
+        let shape = [data.len()];
+        let desc = CopyDescriptor::new(handle.clone().binding(), &shape, &[1], 1);
+        if !valid_strides(desc.shape, desc.strides) {
+            return Err(IoError::UnsupportedStrides);
+        }
 
-        self.write_to_gpu(
-            CopyDescriptor::new(handle.clone().binding(), &[data.len()], &[1], 1),
-            data,
-        )?;
+        let resource = self.resource(desc.binding)?;
+
+        let current = self.streams.current();
+
+        unsafe {
+            write_to_gpu(
+                desc.shape,
+                desc.strides,
+                desc.elem_size,
+                data,
+                resource.ptr,
+                current.sys,
+            )?;
+        };
 
         Ok(handle)
     }
@@ -339,12 +376,10 @@ impl<'a> Command<'a> {
     /// # Returns
     ///
     /// * A `DynFut<()>` future that resolves when the stream is synchronized.
-    pub fn sync(&mut self) -> DynFut<()> {
+    pub fn sync(&mut self) -> DynFut<Result<(), ExecutionError>> {
         let fence = Fence::new(self.streams.current().sys);
 
-        Box::pin(async {
-            fence.wait_sync();
-        })
+        Box::pin(async { fence.wait_sync() })
     }
 
     /// Executes a registered CUDA kernel with the specified parameters.
@@ -374,9 +409,9 @@ impl<'a> Command<'a> {
         resources: &[GpuResource],
         scalars: &[*mut c_void],
         logger: Arc<ServerLogger>,
-    ) {
+    ) -> Result<(), CompilationError> {
         if !self.ctx.module_names.contains_key(&kernel_id) {
-            self.ctx.compile_kernel(&kernel_id, kernel, mode, logger);
+            self.ctx.compile_kernel(&kernel_id, kernel, mode, logger)?;
         }
 
         let stream = self.streams.current();
@@ -396,6 +431,7 @@ impl<'a> Command<'a> {
                 false => self.ctx.timestamps.error(ProfileError::Unknown(err)),
             }
         };
+        Ok(())
     }
 }
 
@@ -423,18 +459,25 @@ pub(crate) unsafe fn write_to_gpu(
             dstPitch: pitch,
             WidthInBytes: width_bytes,
             Height: dim_y,
-            ..Default::default()
+            srcXInBytes: Default::default(),
+            srcY: Default::default(),
+            srcDevice: Default::default(),
+            srcArray: Default::default(),
+            dstXInBytes: Default::default(),
+            dstY: Default::default(),
+            dstHost: Default::default(),
+            dstArray: Default::default(),
         };
 
         unsafe {
             cuMemcpy2DAsync_v2(&cpy, stream)
                 .result()
-                .map_err(|e| IoError::Unknown(format!("CUDA memcpy failed: {}", e)))?;
+                .map_err(|e| IoError::Unknown(format!("CUDA memcpy failed: {e}")))?;
         }
     } else {
         unsafe {
             cudarc::driver::result::memcpy_htod_async(dst_ptr, data, stream)
-                .map_err(|e| IoError::Unknown(format!("CUDA 2D memcpy failed: {}", e)))?;
+                .map_err(|e| IoError::Unknown(format!("CUDA 2D memcpy failed: {e}")))?;
         }
     };
 
@@ -454,7 +497,7 @@ pub(crate) unsafe fn write_to_cpu(
     if rank <= 1 {
         unsafe {
             cudarc::driver::result::memcpy_dtoh_async(bytes.deref_mut(), resource_ptr, stream)
-                .map_err(|e| IoError::Unknown(format!("CUDA memcpy failed: {}", e)))?;
+                .map_err(|e| IoError::Unknown(format!("CUDA memcpy failed: {e}")))?;
         }
         return Ok(());
     }
@@ -474,13 +517,20 @@ pub(crate) unsafe fn write_to_cpu(
         dstPitch: width_bytes,
         WidthInBytes: width_bytes,
         Height: dim_y,
-        ..Default::default()
+        srcXInBytes: Default::default(),
+        srcY: Default::default(),
+        srcArray: Default::default(),
+        dstXInBytes: Default::default(),
+        dstY: Default::default(),
+        dstArray: Default::default(),
+        srcHost: Default::default(),
+        dstDevice: Default::default(),
     };
 
     unsafe {
         cuMemcpy2DAsync_v2(&cpy, stream)
             .result()
-            .map_err(|e| IoError::Unknown(format!("CUDA 2D memcpy failed: {}", e)))?;
+            .map_err(|e| IoError::Unknown(format!("CUDA 2D memcpy failed: {e}")))?;
     }
 
     Ok(())

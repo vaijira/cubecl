@@ -1,8 +1,6 @@
 use cubecl_common::{device::DeviceState, profile::TimingMethod};
 use cubecl_core::{
-    CubeCount, CubeDim, MemoryConfiguration, Runtime,
-    client::ComputeClient,
-    ir::{StorageType, TargetProperties},
+    CubeCount, CubeDim, MemoryConfiguration, Runtime, client::ComputeClient, ir::TargetProperties,
     server::ServerUtilities,
 };
 use cubecl_runtime::{
@@ -21,8 +19,6 @@ use crate::{
     compute::server::{CpuContext, CpuServer},
     device::CpuDevice,
 };
-
-const LOAD_WIDTH: usize = 512;
 
 #[derive(Default)]
 pub struct RuntimeOptions {
@@ -48,6 +44,7 @@ impl DeviceState for CpuServer {
         let logger = cubecl_common::stub::Arc::new(ServerLogger::default());
 
         let topology = HardwareProperties {
+            load_width: 512,
             plane_size_min: 1,
             plane_size_max: 1,
             max_bindings: u32::MAX,
@@ -59,7 +56,6 @@ impl DeviceState for CpuServer {
             num_tensor_cores: None,
             min_tensor_cores_dim: None,
         };
-        let storage = BytesStorage::default();
 
         const ALIGNMENT: u64 = 4;
         let mem_properties = MemoryDeviceProperties {
@@ -68,12 +64,20 @@ impl DeviceState for CpuServer {
         };
 
         let memory_management = MemoryManagement::from_configuration(
-            storage,
+            BytesStorage::default(),
             &mem_properties,
             options.memory_config,
             logger.clone(),
-            MemoryManagementOptions::new("test"),
+            MemoryManagementOptions::new("Main CPU"),
         );
+        let memory_management_shared_memory = MemoryManagement::from_configuration(
+            BytesStorage::default(),
+            &mem_properties,
+            MemoryConfiguration::ExclusivePages,
+            logger.clone(),
+            MemoryManagementOptions::new("Shared Memory"),
+        );
+
         let mut device_props = DeviceProperties::new(
             Default::default(),
             mem_properties,
@@ -82,7 +86,7 @@ impl DeviceState for CpuServer {
         );
         register_supported_types(&mut device_props);
 
-        let ctx = CpuContext::new(memory_management);
+        let ctx = CpuContext::new(memory_management, memory_management_shared_memory);
         let utilities = ServerUtilities::new(device_props, logger, ());
         CpuServer::new(ctx, utilities)
     }
@@ -93,28 +97,16 @@ impl Runtime for CpuRuntime {
     type Server = CpuServer;
     type Device = CpuDevice;
 
-    fn client(device: &Self::Device) -> ComputeClient<Self::Server> {
+    fn client(device: &Self::Device) -> ComputeClient<Self> {
         ComputeClient::load(device)
     }
 
-    fn name(_client: &ComputeClient<Self::Server>) -> &'static str {
+    fn name(_client: &ComputeClient<Self>) -> &'static str {
         "cpu"
     }
 
     fn supported_line_sizes() -> &'static [u8] {
         &[64, 32, 16, 8, 4, 2, 1]
-    }
-
-    fn io_optimized_line_sizes(elem: &StorageType) -> impl Iterator<Item = u8> + Clone {
-        let max = (LOAD_WIDTH / elem.size_bits()) as u8;
-        let supported = Self::supported_line_sizes();
-        supported.iter().filter(move |v| **v <= max).cloned()
-    }
-
-    fn io_optimized_line_sizes_unchecked(elem_size: usize) -> impl Iterator<Item = u8> + Clone {
-        let elem_size_bits = elem_size * 8;
-        let max = LOAD_WIDTH / elem_size_bits;
-        (1..max as u8).rev().filter(|v| v.is_power_of_two())
     }
 
     fn max_cube_count() -> (u32, u32, u32) {

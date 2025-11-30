@@ -18,7 +18,12 @@ pub fn test_qr_cgr<R: Runtime, F: Float + CubeElement + Display>(device: &R::Dev
         pos += dim_usize - 1;
     }
 
-    let a = tensorhandler_from_data::<R, F>(&client, shape.clone(), &data);
+    let a = tensorhandler_from_data::<R, F>(
+        &client,
+        shape.clone(),
+        &data,
+        F::as_type_native_unchecked(),
+    );
 
     /*let bytes = client.read_one_tensor(a.as_copy_descriptor());
     let output = F::from_bytes(&bytes);
@@ -28,8 +33,8 @@ pub fn test_qr_cgr<R: Runtime, F: Float + CubeElement + Display>(device: &R::Dev
         match crate::launch::<R, F>(&crate::Strategy::CommonGivensRotations, &client, &a) {
             Ok((q_t, r)) => (q_t, r),
             Err(_) => (
-                TensorHandle::empty(&client, shape.clone()),
-                TensorHandle::empty(&client, shape.clone()),
+                TensorHandle::empty(&client, shape.clone(), a.dtype),
+                TensorHandle::empty(&client, shape.clone(), a.dtype),
             ),
         };
 
@@ -47,12 +52,25 @@ pub fn test_qr_cgr<R: Runtime, F: Float + CubeElement + Display>(device: &R::Dev
     let output = F::from_bytes(&bytes);
     println!("Q Transposed Output => {output:?}");*/
 
-    let out: TensorHandle<R, F> = TensorHandle::empty(&client, shape.clone());
-    cubecl_matmul::kernels::naive::launch::<R, F, F>(
+    let dtypes = cubecl_matmul::components::MatmulElems {
+        lhs_global: F::as_type_native_unchecked(),
+        rhs_global: F::as_type_native_unchecked(),
+        acc_global: F::as_type_native_unchecked(),
+        lhs_stage: F::as_type_native_unchecked(),
+        rhs_stage: F::as_type_native_unchecked(),
+        acc_stage: F::as_type_native_unchecked(),
+        lhs_register: F::as_type_native_unchecked(),
+        rhs_register: F::as_type_native_unchecked(),
+        acc_register: F::as_type_native_unchecked(),
+    };
+
+    let out: TensorHandle<R> = TensorHandle::empty(&client, shape.clone(), a.dtype);
+    cubecl_matmul::kernels::naive::launch::<R>(
         &client,
         cubecl_matmul::MatmulInputHandle::Normal(q),
         cubecl_matmul::MatmulInputHandle::Normal(r),
         &out.as_ref(),
+        dtypes,
     )
     .unwrap();
 
@@ -61,7 +79,7 @@ pub fn test_qr_cgr<R: Runtime, F: Float + CubeElement + Display>(device: &R::Dev
     println!("Result Output => {output:?}");*/
 
     if let Err(e) =
-        assert_equals_approx::<R, F>(&client, out.handle, &out.shape, &out.strides, &data, 10e-3)
+        assert_equals_approx::<R, F>(&client, out.handle, &out.shape, &out.strides, &data, 10e-5)
     {
         panic!("{}", e);
     }

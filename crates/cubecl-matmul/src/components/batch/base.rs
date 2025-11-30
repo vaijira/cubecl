@@ -1,16 +1,12 @@
 use crate::components::{
-    AccG, AvailableLineSizes, InputRuntimeArg, LhsG, MatmulLineSizes, MatmulPrecision,
-    MatmulProblem, MatmulSelection, MatmulSpec, OutputRuntimeArg, RhsG, TilingScheme,
+    AccG, AvailableLineSizes, InputRuntimeArg, LhsG, MatmulElems, MatmulLineSizes, MatmulPrecision,
+    MatmulProblem, MatmulSelection, OutputRuntimeArg, RhsG,
     batch::{CubeCountInput, CubeCountInputArgs, HypercubeConfig},
     error::MatmulSetupError,
-    global::{self, GlobalConfig as _},
+    global::{GlobalConfig, args::MatmulArgs},
 };
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
-use cubecl_std::{
-    CubeOption,
-    tensor::{View, layout::Coords3d},
-};
 use std::{fmt::Debug, hash::Hash};
 
 /// A family of [matmuls](BatchMatmul) working with any [precision](MatmulPrecision).
@@ -24,11 +20,12 @@ pub trait BatchMatmulFamily: 'static + Send + Sync {
     /// Constructs the configuration based on the matmul problem, selection, and line sizes.
     ///
     /// This function may return an error if the configuration cannot be supported on the current runtime.
-    fn setup<MP: MatmulPrecision, R: Runtime>(
-        client: &ComputeClient<R::Server>,
+    fn setup<R: Runtime>(
+        client: &ComputeClient<R>,
         problem: &MatmulProblem,
         selection: &MatmulSelection,
         line_sizes: &MatmulLineSizes,
+        dtypes: &MatmulElems,
     ) -> Result<Self::Config, MatmulSetupError>;
 
     /// Entry point
@@ -36,15 +33,17 @@ pub trait BatchMatmulFamily: 'static + Send + Sync {
     /// # Safety
     ///
     /// Out-of-bounds can happen
-    unsafe fn launch_unchecked<'a, MS: MatmulSpec, R: Runtime>(
-        client: &ComputeClient<<R as Runtime>::Server>,
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_unchecked<'a, MA: MatmulArgs, R: Runtime>(
+        client: &ComputeClient<R>,
         cube_dim: CubeDim,
         cube_count: CubeCount,
-        input: InputRuntimeArg<'a, MS, R>,
-        output: OutputRuntimeArg<'a, MS, R>,
+        input: InputRuntimeArg<'a, MA, R>,
+        output: OutputRuntimeArg<'a, MA, R>,
         cube_count_input: CubeCountInputArgs<'a, R>,
         config: Self::Config,
-    );
+        dtypes: &MatmulElems,
+    ) -> Result<(), LaunchError>;
 
     /// Filters out line sizes that are incompatible with this matmul family.
     ///
@@ -76,11 +75,8 @@ pub trait BatchMatmul<MP: MatmulPrecision>: 'static + Send + Sync {
     type Config: BatchConfig;
 
     /// Performs batchwise matrix multiplication over tensors.
-    fn execute(
-        a: View<Line<LhsG<MP>>, Coords3d>,
-        b: View<Line<RhsG<MP>>, Coords3d>,
-        c: CubeOption<View<Line<AccG<MP>>, Coords3d>>,
-        out: View<Line<AccG<MP>>, Coords3d, ReadWrite>,
+    fn execute<Args: MatmulArgs>(
+        state: &mut Args::State<LhsG<MP>, RhsG<MP>, AccG<MP>>,
         cube_count_args: CubeCountInput,
         #[comptime] config: Self::Config,
     );
@@ -91,15 +87,10 @@ pub trait BatchConfig:
     Copy + Clone + Eq + PartialEq + Hash + Debug + Send + Sync + 'static
 {
     /// Underlying Global matmul config
-    type GlobalConfig: global::GlobalConfig;
+    type GlobalConfig: GlobalConfig;
 
     /// Convert itself to the underlying global matmul config
     fn global_config(&self) -> Self::GlobalConfig;
-
-    /// Returns the [TilingScheme]
-    fn tiling_scheme(&self) -> TilingScheme {
-        self.global_config().tiling_scheme()
-    }
 
     /// Returns the [CubeDim]
     fn cube_dim(&self) -> CubeDim;

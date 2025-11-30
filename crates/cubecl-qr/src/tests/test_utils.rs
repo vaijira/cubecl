@@ -1,30 +1,33 @@
 use std::fmt::Display;
 
-use cubecl_core::{CubeElement, Runtime, client::ComputeClient, prelude::Float, server};
+use cubecl_core::{
+    CubeElement, Runtime, client::ComputeClient, ir::StorageType, prelude::Float, server,
+};
 use cubecl_std::tensor::{TensorHandle, into_contiguous};
 
 pub(crate) fn tensorhandler_from_data<R: Runtime, F: Float + CubeElement>(
-    client: &ComputeClient<R::Server>,
+    client: &ComputeClient<R>,
     shape: Vec<usize>,
     data: &[F],
-) -> TensorHandle<R, F> {
-    let handle = client.create(F::as_bytes(data));
-    TensorHandle::new_contiguous(shape, handle)
+    dtype: StorageType,
+) -> TensorHandle<R> {
+    let handle = client.create_from_slice(F::as_bytes(data));
+    TensorHandle::new_contiguous(shape, handle, dtype)
 }
 
-pub(crate) fn transpose_matrix<R: Runtime, F: Float + CubeElement>(
-    client: &ComputeClient<R::Server>,
-    matrix: &mut TensorHandle<R, F>,
-) -> TensorHandle<R, F> {
+pub(crate) fn transpose_matrix<R: Runtime>(
+    client: &ComputeClient<R>,
+    matrix: &mut TensorHandle<R>,
+) -> TensorHandle<R> {
     matrix.strides.swap(1, 0);
     matrix.shape.swap(1, 0);
 
-    into_contiguous::<R, F>(client, &matrix.as_ref())
+    into_contiguous::<R>(client, &matrix.as_ref(), matrix.dtype).unwrap()
 }
 
 /// Compares the content of a handle to a given slice of f32.
 pub(crate) fn assert_equals_approx<R: Runtime, F: Float + CubeElement + Display>(
-    client: &ComputeClient<R::Server>,
+    client: &ComputeClient<R>,
     output: server::Handle,
     shape: &[usize],
     strides: &[usize],
