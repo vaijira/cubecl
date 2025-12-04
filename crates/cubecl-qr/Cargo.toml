@@ -1,5 +1,5 @@
 [package]
-authors = ["vaijira <vaijira@gmail.com>"]
+authors = ["Jorge Perez Burgos <vaijira@gmail.com>"]
 categories = ["science", "mathematics", "algorithms"]
 description = "CubeCL QR Decomposition Kernels Engine"
 edition.workspace = true
