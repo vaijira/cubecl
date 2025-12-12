@@ -37,8 +37,7 @@ cubecl-runtime = { path = "../cubecl-runtime", version = "=0.9.0-pre.5", default
     "std",
     "storage-bytes",
 ] }
-<<<<<<< HEAD
-cubecl-qr = { path = "../cubecl-qr", version = "=0.9.0-pre.4", features = [
+cubecl-qr = { path = "../cubecl-qr", version = "=0.9.0-pre.5", features = [
     "export_tests",
 ] }
 cubecl-std = { path = "../cubecl-std", version = "=0.9.0-pre.5", default-features = false }

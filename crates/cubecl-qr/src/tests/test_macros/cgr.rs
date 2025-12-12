@@ -4,7 +4,7 @@
 macro_rules! testgen_qr_cgr {
     () => {
         mod cgr {
-            $crate::testgen_qr_cgr!(f32);
+            $crate::testgen_qr_cgr!(f64);
         }
     };
     ($float:ident) => {
@@ -16,7 +16,7 @@ macro_rules! testgen_qr_cgr {
 
             #[test]
             pub fn test_tiny() {
-                cubecl_qr::tests::cgr::test_qr_cgr::<TestRuntime, FloatT>(&Default::default(), 3);
+                cubecl_qr::tests::cgr::test_qr_cgr::<TestRuntime, FloatT>(&Default::default(), 5);
             }
 
             #[test]
